@@ -1,0 +1,24 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# python / tooling
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# local outputs (may contain transcripts or probe data)
+.ledger/
+.artifacts/
+*.wav
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/
