@@ -25,7 +25,9 @@ from ledgervoice.costs import CostLedger
 
 # Contains both "fifty" and "fifteen" on purpose: number confusion is the core STT risk.
 SMOKE_PHRASE = "Please move fifty dollars from checking to savings, not fifteen."
+EXPECTED_AMOUNTS = [50, 15]  # the amounts in SMOKE_PHRASE, in order
 SAMPLE_RATE = 16_000  # Hz, mono, 16-bit: what STT models expect
+RUN_STARTED = time.time()  # files older than this come from an earlier run
 
 # v2: the first index build ("ledgervoice-smoke") was started with plain dicts and never
 # became visible; a fresh name avoids depending on that stuck build.
@@ -40,6 +42,7 @@ MOSS_DOCS = [
 ]
 MOSS_BUILD_TIMEOUT_S = 180  # index builds are asynchronous
 MOSS_POLL_INTERVAL_S = 3
+N_QUERIES = 20
 
 
 @dataclass
@@ -58,9 +61,45 @@ def p50(values: list[float]) -> float:
     return statistics.median(values)
 
 
-def normalize_words(text: str) -> set[str]:
-    """Lowercase, drop punctuation and '$', split on whitespace. "$50," -> "50"."""
-    return set(re.sub(r"[^a-z0-9\s]", " ", text.lower()).split())
+_ONES = {
+    word: n
+    for n, word in enumerate(
+        "zero one two three four five six seven eight nine ten eleven twelve thirteen "
+        "fourteen fifteen sixteen seventeen eighteen nineteen".split()
+    )
+}
+_TENS = {
+    word: 10 * n
+    for n, word in enumerate("twenty thirty forty fifty sixty seventy eighty ninety".split(), 2)
+}
+# Digit groups with thousands commas ("1,200"), plain digits, or a word.
+_AMOUNT_TOKEN = re.compile(r"\d{1,3}(?:,\d{3})+|\d+|[a-z]+")
+
+
+def extract_amounts(text: str) -> list[int]:
+    """Every amount in `text`, in order: "$1,200" -> 1200, "fifty-five" -> 55.
+
+    Order matters: "fifteen ... not fifty" must not pass as "fifty ... not fifteen".
+    Number words cover 0-99; all other words are ignored.
+    """
+    tokens = _AMOUNT_TOKEN.findall(text.lower().replace("-", " "))
+    amounts: list[int] = []
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token[0].isdigit():
+            amounts.append(int(token.replace(",", "")))
+        elif token in _TENS:
+            value = _TENS[token]
+            following = tokens[i + 1] if i + 1 < len(tokens) else ""
+            if 1 <= _ONES.get(following, 0) <= 9:  # "fifty five" -> 55
+                value += _ONES[following]
+                i += 1
+            amounts.append(value)
+        elif token in _ONES:
+            amounts.append(_ONES[token])
+        i += 1
+    return amounts
 
 
 def pcm_to_wav(pcm: bytes, sample_rate: int = SAMPLE_RATE) -> bytes:
@@ -105,15 +144,11 @@ def check_nessie(s: Settings, ledger: CostLedger) -> CheckResult:
             customers = c.get_customers()
             latencies.append(ms_since(t0))
     ledger.record("nessie", "GET /customers", {"requests": 5}, latency_ms=p50(latencies))
-    notes = []
-    if s.nessie_base_url.startswith("http://"):
-        notes.append("base URL is plain HTTP, which Nessie now refuses; use https://")
     return CheckResult(
         "nessie",
         True,
         f"{len(customers)} customers visible; GET p50 {p50(latencies):.0f} ms, "
         f"max {max(latencies):.0f} ms over 5 calls",
-        notes,
     )
 
 
@@ -123,7 +158,9 @@ def check_claude(s: Settings, ledger: CostLedger) -> CheckResult:
 
     s.require("anthropic_api_key")
     assert s.anthropic_api_key is not None
-    client = anthropic.Anthropic(api_key=s.anthropic_api_key.get_secret_value())
+    client = anthropic.Anthropic(
+        api_key=s.anthropic_api_key.get_secret_value(), timeout=30.0, max_retries=0
+    )
     tools = [
         {
             "name": "get_account_balance",
@@ -176,6 +213,8 @@ def check_claude(s: Settings, ledger: CostLedger) -> CheckResult:
 
 # --- Cartesia TTS ----------------------------------------------------------------
 def check_cartesia_tts(s: Settings, ledger: CostLedger) -> CheckResult:
+    out = s.artifacts_dir / "smoke_tts.wav"
+    out.unlink(missing_ok=True)  # never leave stale audio for the stt check
     s.require("cartesia_api_key")
     body = {
         "model_id": s.cartesia_tts_model,
@@ -191,12 +230,17 @@ def check_cartesia_tts(s: Settings, ledger: CostLedger) -> CheckResult:
     )
     latency = ms_since(t0)
     if resp.is_error:
-        return CheckResult("cartesia_tts", False, f"HTTP {resp.status_code}: {resp.text[:300]}")
+        return CheckResult(
+            "cartesia_tts", False, f"HTTP {resp.status_code}: {s.scrub(resp.text)[:300]}"
+        )
     pcm = resp.content
+    if pcm.startswith(b"{"):
+        return CheckResult("cartesia_tts", False, "response looks like JSON, not PCM")
     if not pcm or len(pcm) % 2:
         return CheckResult("cartesia_tts", False, f"unexpected PCM payload ({len(pcm)} bytes)")
     duration = len(pcm) / (2 * SAMPLE_RATE)
-    out = s.artifacts_dir / "smoke_tts.wav"
+    if not 1.0 <= duration <= 15.0:
+        return CheckResult("cartesia_tts", False, f"implausible audio duration ({duration:.2f} s)")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_bytes(pcm_to_wav(pcm))
     ledger.record(
@@ -216,6 +260,12 @@ def check_cartesia_stt(s: Settings, ledger: CostLedger) -> CheckResult:
     wav_path: Path = s.artifacts_dir / "smoke_tts.wav"
     if not wav_path.exists():
         return CheckResult("cartesia_stt", False, f"needs {wav_path}; run the tts check first")
+    if wav_path.stat().st_mtime < RUN_STARTED:
+        return CheckResult(
+            "cartesia_stt",
+            False,
+            "audio is from an earlier run; run the tts and stt checks together",
+        )
     audio = wav_path.read_bytes()
     t0 = time.perf_counter()
     resp = httpx.post(
@@ -227,7 +277,9 @@ def check_cartesia_stt(s: Settings, ledger: CostLedger) -> CheckResult:
     )
     latency = ms_since(t0)
     if resp.is_error:
-        return CheckResult("cartesia_stt", False, f"HTTP {resp.status_code}: {resp.text[:300]}")
+        return CheckResult(
+            "cartesia_stt", False, f"HTTP {resp.status_code}: {s.scrub(resp.text)[:300]}"
+        )
     text = resp.json().get("text", "")
     ledger.record(
         "cartesia",
@@ -235,16 +287,15 @@ def check_cartesia_stt(s: Settings, ledger: CostLedger) -> CheckResult:
         {"stt_audio_seconds": round(wav_duration_seconds(audio), 2)},
         latency_ms=latency,
     )
-    words = normalize_words(text)
-    has_fifty = bool(words & {"fifty", "50"})
-    has_fifteen = bool(words & {"fifteen", "15"})
+    amounts = extract_amounts(text)
     notes = []
-    if words & {"50", "15"}:
+    if re.search(r"\d", text):
         notes.append("transcript uses digits; amount parsing in M1 must accept both forms")
     return CheckResult(
         "cartesia_stt",
-        has_fifty and has_fifteen,
-        f"{latency:.0f} ms; transcript: {text!r} (fifty={has_fifty}, fifteen={has_fifteen})",
+        amounts == EXPECTED_AMOUNTS,
+        f"{latency:.0f} ms; transcript: {text!r}; amounts {amounts} "
+        f"(expected {EXPECTED_AMOUNTS}, in order)",
         notes,
     )
 
@@ -277,9 +328,13 @@ async def _moss(s: Settings, ledger: CostLedger) -> CheckResult:
             if idx is None:
                 docs = [DocumentInfo(id=doc_id, text=text) for doc_id, text in MOSS_DOCS]
                 try:
-                    await client.create_index(MOSS_INDEX, docs)
-                except Exception as exc:  # e.g. a build from an earlier run is still going
-                    notes.append(f"create_index: {type(exc).__name__}: {s.scrub(str(exc))[:150]}")
+                    # wait=False: our polling loop below enforces MOSS_BUILD_TIMEOUT_S.
+                    await client.create_index(MOSS_INDEX, docs, wait=False)
+                except Exception as exc:
+                    msg = f"create_index: {type(exc).__name__}: {s.scrub(str(exc))}"
+                    if "already running" not in msg.lower():
+                        return CheckResult("moss", False, msg[:300], notes)
+                    notes.append(msg[:150])  # a build from an earlier run is still going
             deadline = time.monotonic() + MOSS_BUILD_TIMEOUT_S
             while _status(idx).lower() != "ready":
                 if _status(idx).lower() in {"failed", "error"}:
@@ -307,28 +362,32 @@ async def _moss(s: Settings, ledger: CostLedger) -> CheckResult:
         query = "that coffee place downtown"
         latencies: list[float] = []
         results = None
-        for _ in range(20):
+        for _ in range(N_QUERIES):
             t0 = time.perf_counter()
             results = await client.query(MOSS_INDEX, query, QueryOptions(top_k=3))
             latencies.append(ms_since(t0))
         assert results is not None
-        ledger.record("moss", "query", {"queries": 20}, latency_ms=p50(latencies))
+        ledger.record("moss", "query", {"queries": N_QUERIES}, latency_ms=p50(latencies))
 
         if not results.docs:
             return CheckResult("moss", False, "query returned no documents", notes)
         top = results.docs[0]
         ok = getattr(top, "id", None) == "m-coffee" or "Blue Door Coffee" in top.text
         server_ms = getattr(results, "time_taken_ms", None)
+        p95 = statistics.quantiles(latencies, n=20, method="inclusive")[-1]
         return CheckResult(
             "moss",
             ok,
             f"top hit {top.text!r} (score {top.score:.3f}); client-side p50 "
-            f"{p50(latencies):.1f} ms, p95 {sorted(latencies)[18]:.1f} ms over 20 queries; "
+            f"{p50(latencies):.1f} ms, p95 {p95:.1f} ms over {N_QUERIES} queries; "
             f"server-reported {server_ms} ms",
             notes,
         )
     except Exception as exc:  # keep the notes gathered so far
         return CheckResult("moss", False, s.scrub(f"{type(exc).__name__}: {exc}")[:300], notes)
+    finally:
+        if hasattr(client, "close"):
+            await client.close()
 
 
 def check_moss(s: Settings, ledger: CostLedger) -> CheckResult:

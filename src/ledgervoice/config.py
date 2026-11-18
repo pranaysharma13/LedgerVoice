@@ -11,7 +11,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import SecretStr
+from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -48,6 +48,13 @@ class Settings(BaseSettings):
     # Local paths
     cost_ledger_path: Path = Path(".ledger/costs.jsonl")
     artifacts_dir: Path = Path(".artifacts")
+
+    @field_validator("nessie_base_url")
+    @classmethod
+    def _require_https(cls, value: str) -> str:
+        if not value.startswith("https://"):
+            raise ValueError("Nessie base URL must use https:// (the API key is sent in the URL)")
+        return value
 
     def require(self, *names: str) -> None:
         """Raise a readable error listing every missing setting (by env var name)."""

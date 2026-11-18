@@ -11,6 +11,8 @@ A real-time voice banking agent built with Claude, Cartesia, Moss and the Capita
     make test                 # offline
     make smoke                # one real call per API
 
+Run all commands from the repo root; .env, .ledger/ and .artifacts/ are resolved relative to it.
+
 ## Layout
     packages/nessie-tools/    typed Nessie client (fake backend arrives in M1)
     src/ledgervoice/          app code: config, cost ledger, smoke checks

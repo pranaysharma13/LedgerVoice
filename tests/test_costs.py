@@ -29,8 +29,24 @@ def test_summarize_totals_per_service(tmp_path):
     ledger.record("nessie", "GET /customers", {"requests": 5})
     ledger.record("nessie", "GET /customers", {"requests": 3})
 
-    totals = summarize(path)
+    totals, skipped = summarize(path)
 
     assert totals["nessie"]["calls"] == 2
     assert totals["nessie"]["units"]["requests"] == 8
-    assert summarize(tmp_path / "missing.jsonl") == {}
+    assert skipped == 0
+    assert summarize(tmp_path / "missing.jsonl") == ({}, 0)
+
+
+def test_summarize_skips_malformed_lines(tmp_path):
+    path = tmp_path / "costs.jsonl"
+    ledger = CostLedger(path, pricing={("nessie", "requests"): 0.0})
+    ledger.record("nessie", "GET /customers", {"requests": 5})
+    with path.open("a", encoding="utf-8") as f:
+        f.write('{"service": "nessie", "units": {"req\n')  # a write cut off mid-line
+    ledger.record("nessie", "GET /customers", {"requests": 3})
+
+    totals, skipped = summarize(path)
+
+    assert skipped == 1
+    assert totals["nessie"]["calls"] == 2
+    assert totals["nessie"]["units"]["requests"] == 8

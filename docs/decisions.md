@@ -19,3 +19,5 @@
 | D15 | Transfer mechanics | Withdrawal (source) + deposit (destination) behind one `transfer()`, run as a saga with a compensating action; our audit log is the source of truth | Nessie transfers have no destination field | Accepted 2026-11-18 |
 | D16 | Non-whole amounts | Reject non-integer amounts before calling Nessie; agent asks for a whole-dollar amount | Nessie stores integers and may silently truncate | Accepted 2026-11-18 |
 | D17 | Process | Deliver M0 v2 (known fixes + probe v2) before the Claude Code review | Review corrected code, not code already known to be wrong | Accepted 2026-11-18 |
+| D18 | Balance source | Current balance = Nessie stored balance (opening balance at seed time) + deposits - withdrawals - completed purchases, computed in nessie-tools | Nessie transactions never change the stored balance | Accepted 2026-11-18 |
+| D19 | Review triage rule | Accept safety/secret/measurement issues and cheap fixes in code M1 builds on; defer what M1 rewrites; reject hardening of one-off tools | Keeps effort proportional; nothing deferred gets lost | Accepted 2026-11-18 |

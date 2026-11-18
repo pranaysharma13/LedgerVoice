@@ -15,7 +15,7 @@ import httpx
 
 DEFAULT_BASE_URL = "https://api.nessieisreal.com"
 
-_KEY_PARAM = re.compile(r"(key=)[^&\s'\"]+")
+_KEY_PARAM = re.compile(r"([?&]key=)[^&\s'\"]+")
 
 
 def redact_key(text: str, api_key: str | None = None) -> str:
@@ -47,8 +47,12 @@ class NessieClient:
     ) -> None:
         if not api_key:
             raise ValueError("Nessie API key is required")
+        if not base_url.startswith("https://"):
+            raise ValueError("Nessie base URL must use https:// (the API key is sent in the URL)")
         self._api_key = api_key
-        self._http = http or httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout)
+        self._http = http or httpx.Client(
+            base_url=base_url.rstrip("/"), timeout=timeout, follow_redirects=False
+        )
 
     # --- lifecycle -------------------------------------------------------------
     def close(self) -> None:
@@ -77,9 +81,9 @@ class NessieClient:
             msg = redact_key(f"{type(exc).__name__} calling {method} {path}: {exc}", self._api_key)
             raise NessieError(msg) from None
 
-        if resp.is_error:
+        if not resp.is_success:
             url = redact_key(str(resp.request.url), self._api_key)
-            body = redact_key(resp.text[:500], self._api_key)
+            body = redact_key(resp.text, self._api_key)[:500]
             raise NessieError(
                 f"{method} {url} -> HTTP {resp.status_code}: {body}",
                 status_code=resp.status_code,
@@ -91,11 +95,14 @@ class NessieClient:
             return resp.json()
         except ValueError:
             raise NessieError(
-                f"{method} {path} returned non-JSON body: {resp.text[:200]!r}",
+                f"{method} {path} returned non-JSON body: "
+                f"{redact_key(resp.text, self._api_key)[:200]!r}",
                 status_code=resp.status_code,
             ) from None
 
     # --- endpoints used in M0 --------------------------------------------------
     def get_customers(self) -> list[dict[str, Any]]:
         data = self.request("GET", "/customers")
-        return data if isinstance(data, list) else []
+        if not isinstance(data, list):
+            raise NessieError(f"expected a list of customers, got {type(data).__name__}")
+        return data

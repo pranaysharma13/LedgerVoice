@@ -1,14 +1,19 @@
 PY := .venv/bin/python
 
-.PHONY: venv setup freeze test lint fmt smoke probe-nessie costs
+.PHONY: venv setup upgrade freeze test lint fmt smoke probe-nessie costs
 
 venv:
 	python3.12 -m venv .venv
 
 setup: venv
 	$(PY) -m pip install --upgrade pip
-	$(PY) -m pip install -e packages/nessie-tools -e ".[dev]"
+	$(PY) -m pip install -r requirements.lock
+	$(PY) -m pip install --no-deps -e packages/nessie-tools -e ".[dev]"
 	$(PY) -m pre_commit install
+
+upgrade:
+	$(PY) -m pip install --upgrade -e packages/nessie-tools -e ".[dev]"
+	$(PY) -m pip freeze --exclude-editable > requirements.lock
 
 freeze:
 	$(PY) -m pip freeze --exclude-editable > requirements.lock

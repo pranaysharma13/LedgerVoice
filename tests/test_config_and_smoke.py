@@ -1,8 +1,16 @@
 import pytest
+from pydantic import ValidationError
 
 from ledgervoice.config import MissingConfigError, Settings
 from ledgervoice.costs import CostLedger
-from ledgervoice.smoke.checks import normalize_words, pcm_to_wav, run_check, wav_duration_seconds
+from ledgervoice.smoke.checks import (
+    CHECKS,
+    EXPECTED_AMOUNTS,
+    extract_amounts,
+    pcm_to_wav,
+    run_check,
+    wav_duration_seconds,
+)
 
 
 def bare_settings(**overrides) -> Settings:
@@ -32,8 +40,41 @@ def test_missing_key_is_reported_as_skip_not_crash(tmp_path, monkeypatch):
     assert not result.ok and result.summary.startswith("skipped")
 
 
-def test_normalize_words_handles_digits_and_punctuation():
-    assert {"50", "fifteen"} <= normalize_words("Move $50, not fifteen.")
+def test_extract_amounts_digits_in_order():
+    assert extract_amounts("Please move $50 from checking to savings, not $15.") == [50, 15]
+
+
+def test_extract_amounts_words_in_order():
+    assert extract_amounts("move fifty dollars, not fifteen") == [50, 15]
+
+
+def test_extract_amounts_detects_swapped_numbers():
+    swapped = extract_amounts("move fifteen dollars, not fifty")
+    assert swapped == [15, 50]
+    assert swapped != EXPECTED_AMOUNTS
+
+
+def test_extract_amounts_compounds_and_thousands():
+    assert extract_amounts("fifty-five") == [55]
+    assert extract_amounts("$1,200") == [1200]
+
+
+def test_run_check_scrubs_secrets_from_errors(tmp_path, monkeypatch):
+    secret = "fake-nessie-secret"
+    s = bare_settings(nessie_api_key=secret, cost_ledger_path=tmp_path / "c.jsonl")
+
+    def boom(settings, ledger):
+        raise RuntimeError(f"request failed with key {secret}")
+
+    monkeypatch.setitem(CHECKS, "boom", boom)
+    result = run_check("boom", s, CostLedger(s.cost_ledger_path))
+    assert result.ok is False
+    assert secret not in result.summary
+
+
+def test_settings_rejects_plain_http_nessie_url():
+    with pytest.raises(ValidationError, match="https://"):
+        bare_settings(nessie_base_url="http://api.nessieisreal.com")
 
 
 def test_pcm_to_wav_header_matches_data():

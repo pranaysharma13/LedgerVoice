@@ -1,4 +1,4 @@
-# Installed by `make setup`. Run `uv run pre-commit autoupdate` to move these
+# Installed by `make setup`. Run `.venv/bin/pre-commit autoupdate` to move these
 # pinned revs to the latest releases.
 repos:
   - repo: https://github.com/gitleaks/gitleaks
@@ -8,7 +8,7 @@ repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.17.5
     hooks:
-      - id: ruff
+      - id: ruff-check
         args: [--fix]
       - id: ruff-format
   - repo: https://github.com/pre-commit/pre-commit-hooks

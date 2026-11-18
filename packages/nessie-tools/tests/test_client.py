@@ -45,3 +45,56 @@ def test_transport_error_is_wrapped_and_redacted():
 def test_redact_key_handles_param_and_literal():
     assert redact_key("http://x/customers?key=zzz&a=1") == "http://x/customers?key=***&a=1"
     assert redact_key("token zzz leaked", "zzz") == "token *** leaked"
+
+
+def test_redirect_is_an_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(301, headers={"location": "https://elsewhere.test/"})
+
+    with make_client(handler) as client, pytest.raises(NessieError) as info:
+        client.get_customers()
+    assert info.value.status_code == 301
+
+
+def test_non_json_body_is_an_error_and_redacted():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=f"<html>oops {KEY}</html>")
+
+    with make_client(handler) as client, pytest.raises(NessieError) as info:
+        client.request("GET", "/customers")
+    assert KEY not in str(info.value)
+
+
+def test_empty_body_returns_none():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200)
+
+    with make_client(handler) as client:
+        assert client.request("GET", "/customers") is None
+
+
+def test_get_customers_rejects_non_list():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"code": 404, "message": "not found"})
+
+    with make_client(handler) as client, pytest.raises(NessieError):
+        client.get_customers()
+
+
+def test_key_straddling_truncation_boundary_is_redacted():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="x" * 495 + KEY + "y" * 100)
+
+    with make_client(handler) as client, pytest.raises(NessieError) as info:
+        client.get_customers()
+    assert KEY not in str(info.value)
+    assert KEY[:6] not in str(info.value)
+
+
+def test_plain_http_base_url_is_rejected():
+    with pytest.raises(ValueError):
+        NessieClient("k", base_url="http://example.com")
+
+
+def test_redact_key_ignores_params_that_only_end_in_key():
+    assert redact_key("monkey=banana") == "monkey=banana"

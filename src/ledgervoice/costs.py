@@ -90,15 +90,21 @@ class CostLedger:
         return row
 
 
-def summarize(path: Path) -> dict[str, dict[str, Any]]:
-    """Totals per service: calls, summed units, estimated USD, units still unpriced."""
+def summarize(path: Path) -> tuple[dict[str, dict[str, Any]], int]:
+    """Totals per service (calls, summed units, estimated USD, units still unpriced),
+    plus the number of malformed lines skipped (e.g. a write cut off by a crash)."""
     totals: dict[str, dict[str, Any]] = {}
+    skipped = 0
     if not Path(path).exists():
-        return totals
+        return totals, skipped
     for line in Path(path).read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
-        row = json.loads(line)
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            skipped += 1
+            continue
         t = totals.setdefault(
             row["service"],
             {"calls": 0, "units": defaultdict(float), "est_usd": 0.0, "unpriced": set()},
@@ -108,14 +114,16 @@ def summarize(path: Path) -> dict[str, dict[str, Any]]:
             t["units"][unit] += amount
         t["est_usd"] += row["est_usd"]
         t["unpriced"].update(row["unpriced_units"])
-    return totals
+    return totals, skipped
 
 
 def main() -> None:
     from ledgervoice.config import get_settings
 
     path = Path(sys.argv[1]) if len(sys.argv) > 1 else get_settings().cost_ledger_path
-    totals = summarize(path)
+    totals, skipped = summarize(path)
+    if skipped:
+        print(f"skipped {skipped} malformed line(s)")
     if not totals:
         print(f"No ledger entries at {path}")
         return
