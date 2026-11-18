@@ -13,7 +13,7 @@ from typing import Any
 
 import httpx
 
-DEFAULT_BASE_URL = "http://api.nessieisreal.com"
+DEFAULT_BASE_URL = "https://api.nessieisreal.com"
 
 _KEY_PARAM = re.compile(r"(key=)[^&\s'\"]+")
 

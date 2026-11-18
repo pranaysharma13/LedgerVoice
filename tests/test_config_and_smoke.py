@@ -2,7 +2,7 @@ import pytest
 
 from ledgervoice.config import MissingConfigError, Settings
 from ledgervoice.costs import CostLedger
-from ledgervoice.smoke.checks import normalize_words, run_check
+from ledgervoice.smoke.checks import normalize_words, pcm_to_wav, run_check, wav_duration_seconds
 
 
 def bare_settings(**overrides) -> Settings:
@@ -34,3 +34,10 @@ def test_missing_key_is_reported_as_skip_not_crash(tmp_path, monkeypatch):
 
 def test_normalize_words_handles_digits_and_punctuation():
     assert {"50", "fifteen"} <= normalize_words("Move $50, not fifteen.")
+
+
+def test_pcm_to_wav_header_matches_data():
+    pcm = b"\x00\x00" * 16_000  # 1 second of 16 kHz mono silence
+    wav = pcm_to_wav(pcm)
+    assert wav[:4] == b"RIFF"
+    assert wav_duration_seconds(wav) == 1.0

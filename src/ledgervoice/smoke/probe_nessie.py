@@ -1,21 +1,22 @@
-"""Exploratory probe: answers the Nessie unknowns M1's design depends on.
+"""Probe v2: verifies the Nessie behaviors M1 depends on, using the schema the server
+itself reported on 2026-11-18 (the public docs are incomplete and partly wrong).
 
-WRITES to your Nessie sandbox (creates one customer, two accounts, one merchant, one
-purchase, one transfer, one bill, all tagged "Probe"). It never calls DELETE /data,
-which would wipe everything tied to your key.
+WRITES to your Nessie sandbox: one customer, two accounts, a few transactions. The two
+accounts are deleted at the end unless you pass --keep. The probe merchant is reused
+across runs (merchants can't be deleted). It never calls DELETE /data.
 
-Questions it answers:
-  Q1  Can we set purchase_date in the past?   (needed to seed "last week" spending)
-  Q2  Where does category live: purchase or merchant, string or list?
-  Q3  What status does a new transfer get, and does it change after a re-fetch?
-  Q4  Do account balances change after a purchase / transfer?
-  Q5  Do bills work (create + list)?
-  Q6  Does HTTPS work for the base URL?
+Questions:
+  Q1  Is a back-dated purchase_date stored as sent?
+  Q2  Is merchant category stored as a string?
+  Q3  Do purchases / withdrawals / deposits / native transfers change balances?
+  Q4  Is a non-integer amount rejected, or silently truncated?            (D16)
+  Q5  Can a withdrawal be cancelled via PUT, and does that restore the balance?
+      (the compensating action for the transfer saga, D15)
+  Q6  Does PUT /accounts/{id} let us set a balance?   (fallback if Q3 says "no change")
+  Q7  What does an empty transfers list return?
+  Q8  Does DELETE /accounts/{id} work?                (cleanup between eval runs)
 
-The request bodies follow the documented Nessie schema as best we know it. If Nessie
-rejects a field, the probe prints its error message: that's a finding too.
-
-Run:  python -m ledgervoice.smoke.probe_nessie --yes
+Run:  python -m ledgervoice.smoke.probe_nessie --yes [--keep]
 """
 
 from __future__ import annotations
@@ -24,13 +25,13 @@ import argparse
 import json
 import logging
 import sys
+import time
 from datetime import date, timedelta
 from typing import Any
 
-import httpx
 from nessie_tools import NessieClient, NessieError
 
-from ledgervoice.config import get_settings
+from ledgervoice.config import Settings, get_settings
 
 ADDRESS = {
     "street_number": "100",
@@ -39,6 +40,8 @@ ADDRESS = {
     "state": "VA",
     "zip": "22201",
 }
+MERCHANT_NAME = "LV Probe Coffee"
+SETTLE_SECONDS = 3  # re-read balances after a pause, in case updates are asynchronous
 
 
 class Probe:
@@ -46,42 +49,215 @@ class Probe:
         self.c = client
         self.log: list[dict[str, Any]] = []
 
-    def call(self, label: str, method: str, path: str, body: Any = None) -> Any:
+    def call(
+        self, label: str, method: str, path: str, body: Any = None, quiet: bool = False
+    ) -> dict[str, Any]:
+        """Send one request; record and return {ok, response | error, status_code}."""
         entry: dict[str, Any] = {"step": label, "request": f"{method} {path}", "body": body}
         try:
-            resp = self.c.request(method, path, json=body)
+            entry["response"] = self.c.request(method, path, json=body)
             entry["ok"] = True
-            entry["response"] = resp
         except NessieError as exc:  # message is already key-redacted
-            entry["ok"] = False
-            entry["error"] = str(exc)
-            resp = None
+            entry.update(ok=False, error=str(exc), status_code=exc.status_code)
         self.log.append(entry)
-        status = "ok " if entry["ok"] else "ERR"
-        print(f"  [{status}] {label}: {method} {path}")
+        if not quiet or not entry["ok"]:
+            print(f"  [{'ok ' if entry['ok'] else 'ERR'}] {label}")
         if not entry["ok"]:
-            print(f"        {entry['error'][:300]}")
-        return resp
+            print(f"        {entry['error'][:400]}")
+        return entry
+
+    def balance(self, account_id: str) -> Any:
+        e = self.call("read balance", "GET", f"/accounts/{account_id}", quiet=True)
+        r = e.get("response")
+        return r.get("balance") if isinstance(r, dict) else None
+
+    def find(self, path: str, description: str) -> dict[str, Any] | None:
+        """Find a transaction on an account list endpoint by its description."""
+        items = self.call(f"list {path}", "GET", path, quiet=True).get("response") or []
+        if not isinstance(items, list):
+            return None
+        return next(
+            (x for x in items if isinstance(x, dict) and x.get("description") == description),
+            None,
+        )
 
 
-def created_id(resp: Any) -> str | None:
-    """Nessie POSTs usually return {"code": 201, "objectCreated": {"_id": ...}}."""
+def obj_id(resp: Any) -> str | None:
+    """Create responses look like {"code": 201, "objectCreated": {"_id": ...}}."""
     if isinstance(resp, dict):
         obj = resp.get("objectCreated") or resp
-        return obj.get("_id") if isinstance(obj, dict) else None
+        if isinstance(obj, dict):
+            return obj.get("_id") or obj.get("id")
     return None
 
 
-def balance(p: Probe, account_id: str | None, label: str) -> Any:
-    if not account_id:
-        return None
-    acct = p.call(f"read {label} balance", "GET", f"/accounts/{account_id}")
-    return acct.get("balance") if isinstance(acct, dict) else None
+def delta(before: Any, after: Any) -> Any:
+    if isinstance(before, int | float) and isinstance(after, int | float):
+        return after - before
+    return None
+
+
+def find_or_create_merchant(p: Probe, f: dict[str, Any]) -> str | None:
+    merchants = p.call("list merchants", "GET", "/merchants", quiet=True).get("response") or []
+    existing = [m for m in merchants if isinstance(m, dict) and m.get("name") == MERCHANT_NAME]
+    if existing:
+        mid = existing[0].get("_id")
+        print(f"  [ok ] reusing merchant {MERCHANT_NAME!r}")
+    else:
+        body = {
+            "name": MERCHANT_NAME,
+            "category": "food",
+            "address": ADDRESS,
+            "geocode": {"lat": 38.88, "lng": -77.10},
+        }
+        mid = obj_id(p.call("create merchant", "POST", "/merchants", body).get("response"))
+    if mid:
+        m = p.call("read merchant", "GET", f"/merchants/{mid}", quiet=True).get("response")
+        f["Q2_merchant_category_stored"] = m.get("category") if isinstance(m, dict) else None
+    return mid
+
+
+def run_questions(
+    p: Probe, f: dict[str, Any], chk: str, sav: str, merchant: str | None, past: str, today: str
+) -> None:
+    purchases = f"/accounts/{chk}/purchases"
+
+    if merchant:
+        print("Q1/Q3: back-dated purchase ($5, 10 days ago)")
+        b0 = p.balance(chk)
+        p.call(
+            "create purchase",
+            "POST",
+            purchases,
+            {
+                "merchant_id": merchant,
+                "medium": "balance",
+                "amount": 5,
+                "purchase_date": past,
+                "description": "LV probe latte",
+                "status": "completed",
+            },
+        )
+        f["Q3_purchase_checking_delta"] = delta(b0, p.balance(chk))
+        latte = p.find(purchases, "LV probe latte")
+        f["Q1_purchase_date_sent"] = past
+        f["Q1_purchase_date_stored"] = latte.get("purchase_date") if latte else None
+        f["purchase_fields"] = sorted(latte) if latte else None
+
+        print("Q4: non-integer amount ($4.75)")
+        b0 = p.balance(chk)
+        e = p.call(
+            "create purchase with amount 4.75",
+            "POST",
+            purchases,
+            {
+                "merchant_id": merchant,
+                "medium": "balance",
+                "amount": 4.75,
+                "purchase_date": today,
+                "description": "LV probe fraction",
+                "status": "completed",
+            },
+        )
+        if e["ok"]:
+            frac = p.find(purchases, "LV probe fraction")
+            stored = frac.get("amount") if frac else "?"
+            f["Q4_non_integer_amount"] = f"ACCEPTED, stored amount = {stored}"
+        else:
+            f["Q4_non_integer_amount"] = f"REJECTED (HTTP {e.get('status_code')})"
+        f["Q4_checking_delta"] = delta(b0, p.balance(chk))
+    else:
+        print("Skipping purchase questions: no merchant")
+
+    print("Q3/Q5: transfer as withdrawal + deposit ($50, D15)")
+    c0, s0 = p.balance(chk), p.balance(sav)
+    w = p.call(
+        "withdraw $50 from checking",
+        "POST",
+        f"/accounts/{chk}/withdrawals",
+        {
+            "medium": "balance",
+            "amount": 50,
+            "transaction_date": today,
+            "description": "LV-TRF-probe leg 1/2",
+            "status": "completed",
+        },
+    )
+    f["Q3_withdrawal_checking_delta"] = delta(c0, p.balance(chk))
+    p.call(
+        "deposit $50 into savings",
+        "POST",
+        f"/accounts/{sav}/deposits",
+        {
+            "medium": "balance",
+            "amount": 50,
+            "transaction_date": today,
+            "description": "LV-TRF-probe leg 2/2",
+            "status": "completed",
+        },
+    )
+    f["Q3_deposit_savings_delta"] = delta(s0, p.balance(sav))
+
+    wid = obj_id(w.get("response"))
+    if wid:
+        c1 = p.balance(chk)
+        p.call(
+            "cancel the withdrawal via PUT", "PUT", f"/withdrawals/{wid}", {"status": "cancelled"}
+        )
+        f["Q5_cancel_checking_delta"] = delta(c1, p.balance(chk))
+        wr = p.call("re-read withdrawal", "GET", f"/withdrawals/{wid}", quiet=True).get("response")
+        f["Q5_withdrawal_status_after"] = wr.get("status") if isinstance(wr, dict) else None
+    else:
+        f["Q5_cancel_checking_delta"] = "skipped: withdrawal id not returned"
+
+    print("Q7: empty transfers list")
+    e = p.call("list transfers on savings", "GET", f"/accounts/{sav}/transfers", quiet=True)
+    f["Q7_empty_transfers"] = (
+        f"HTTP 200: {e.get('response')!r}"
+        if e["ok"]
+        else f"HTTP {e.get('status_code')}: {e['error'][-60:]}"
+    )
+
+    print("Q3: native transfer ($10; it has no destination field)")
+    c0 = p.balance(chk)
+    p.call(
+        "create native transfer",
+        "POST",
+        f"/accounts/{chk}/transfers",
+        {
+            "transaction_date": today,
+            "status": "completed",
+            "amount": 10,
+            "description": "LV probe native transfer",
+        },
+    )
+    f["Q3_native_transfer_checking_delta"] = delta(c0, p.balance(chk))
+
+    print(f"Waiting {SETTLE_SECONDS} s, then re-reading balances (async updates?)")
+    time.sleep(SETTLE_SECONDS)
+    f["final_checking_after_wait (started 1000)"] = p.balance(chk)
+    f["final_savings_after_wait (started 500)"] = p.balance(sav)
+
+    print("Q6: set a balance via PUT")
+    p.call("PUT savings balance = 777", "PUT", f"/accounts/{sav}", {"balance": 777})
+    f["Q6_savings_after_put (expect 777)"] = p.balance(sav)
+
+
+def save(s: Settings, findings: dict[str, Any], log: list[dict[str, Any]]) -> None:
+    out = s.artifacts_dir / "nessie_probe_v2.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    text = s.scrub(json.dumps({"findings": findings, "log": log}, indent=2, default=str))
+    out.write_text(text, encoding="utf-8")
+    print("\nFindings:")
+    for k, v in findings.items():
+        print(f"  {k}: {v}")
+    print(f"\nFull request/response log: {out}")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Probe Nessie sandbox behavior (writes data)")
     parser.add_argument("--yes", action="store_true", help="confirm writing probe data")
+    parser.add_argument("--keep", action="store_true", help="don't delete the probe accounts")
     args = parser.parse_args()
     if not args.yes:
         print("This writes test data to your Nessie sandbox. Re-run with --yes to proceed.")
@@ -91,130 +267,60 @@ def main() -> int:
     s = get_settings()
     s.require("nessie_api_key")
     assert s.nessie_api_key is not None
-    key = s.nessie_api_key.get_secret_value()
     findings: dict[str, Any] = {}
     past = (date.today() - timedelta(days=10)).isoformat()
     today = date.today().isoformat()
 
-    with NessieClient(key, base_url=s.nessie_base_url) as client:
+    with NessieClient(s.nessie_api_key.get_secret_value(), base_url=s.nessie_base_url) as client:
         p = Probe(client)
-
-        print("Creating probe customer + accounts")
-        customer_body = {"first_name": "Pat", "last_name": "Probe", "address": ADDRESS}
-        cust = created_id(p.call("create customer", "POST", "/customers", customer_body))
-        checking = savings = None
-        if cust:
-            checking_body = {
-                "type": "Checking",
-                "nickname": "Probe Checking",
-                "rewards": 0,
-                "balance": 1000,
-            }
-            savings_body = {
-                "type": "Savings",
-                "nickname": "Probe Savings",
-                "rewards": 0,
-                "balance": 500,
-            }
-            path = f"/customers/{cust}/accounts"
-            checking = created_id(p.call("create checking", "POST", path, checking_body))
-            savings = created_id(p.call("create savings", "POST", path, savings_body))
-
-        print("Q2: merchant category")
-        merchant_body = {
-            "name": "Probe Coffee Downtown",
-            "category": ["Coffee Shop"],
-            "address": ADDRESS,
-            "geocode": {"lat": 38.88, "lng": -77.10},
-        }
-        merchant = created_id(p.call("create merchant", "POST", "/merchants", merchant_body))
-        if merchant:
-            m = p.call("read merchant", "GET", f"/merchants/{merchant}")
-            findings["Q2_merchant_category"] = m.get("category") if isinstance(m, dict) else None
-
-        print("Q1/Q4: back-dated purchase")
-        bal_before = balance(p, checking, "checking")
-        if checking and merchant:
-            purchase_body = {
-                "merchant_id": merchant,
-                "medium": "balance",
-                "purchase_date": past,
-                "amount": 4.75,
-                "description": "Probe latte",
-            }
+        print("Setup")
+        cust = obj_id(
             p.call(
-                "create purchase (10 days ago)",
+                "create customer",
                 "POST",
-                f"/accounts/{checking}/purchases",
-                purchase_body,
-            )
-            purchases = p.call("list purchases", "GET", f"/accounts/{checking}/purchases")
-            if isinstance(purchases, list) and purchases:
-                first = purchases[0]
-                findings["Q1_purchase_date_sent"] = past
-                findings["Q1_purchase_date_stored"] = first.get("purchase_date")
-                findings["Q2_purchase_fields"] = sorted(first.keys())
-                findings["purchase_status"] = first.get("status")
-        findings["Q4_checking_balance_before_purchase"] = bal_before
-        findings["Q4_checking_balance_after_purchase"] = balance(p, checking, "checking")
+                "/customers",
+                {"first_name": "Pat", "last_name": "ProbeTwo", "address": ADDRESS},
+            ).get("response")
+        )
+        if not cust:
+            save(s, findings, p.log)
+            return 1
+        accounts = f"/customers/{cust}/accounts"
+        chk = obj_id(
+            p.call(
+                "create checking ($1000)",
+                "POST",
+                accounts,
+                {"type": "Checking", "nickname": "Probe2 Checking", "rewards": 0, "balance": 1000},
+            ).get("response")
+        )
+        sav = obj_id(
+            p.call(
+                "create savings ($500)",
+                "POST",
+                accounts,
+                {"type": "Savings", "nickname": "Probe2 Savings", "rewards": 0, "balance": 500},
+            ).get("response")
+        )
+        if not (chk and sav):
+            save(s, findings, p.log)
+            return 1
+        merchant = find_or_create_merchant(p, findings)
 
-        print("Q3/Q4: transfer checking -> savings")
-        if checking and savings:
-            sav_before = balance(p, savings, "savings")
-            transfer_body = {
-                "medium": "balance",
-                "payee_id": savings,
-                "amount": 50,
-                "transaction_date": today,
-                "description": "Probe transfer",
-            }
-            resp = p.call(
-                "create transfer", "POST", f"/accounts/{checking}/transfers", transfer_body
-            )
-            tid = created_id(resp)
-            if isinstance(resp, dict):
-                obj = resp.get("objectCreated") or {}
-                findings["Q3_transfer_status_on_create"] = obj.get("status")
-            if tid:
-                t = p.call("re-read transfer", "GET", f"/transfers/{tid}")
-                findings["Q3_transfer_status_on_reread"] = (
-                    t.get("status") if isinstance(t, dict) else None
-                )
-            findings["Q4_savings_before_transfer"] = sav_before
-            findings["Q4_savings_after_transfer"] = balance(p, savings, "savings")
-            findings["Q4_checking_after_transfer"] = balance(p, checking, "checking")
+        try:
+            run_questions(p, findings, chk, sav, merchant, past, today)
+        finally:
+            if args.keep:
+                print("Keeping probe accounts (--keep)")
+            else:
+                print("Q8: cleanup")
+                for label, acct in (("checking", chk), ("savings", sav)):
+                    e = p.call(f"delete probe {label}", "DELETE", f"/accounts/{acct}")
+                    findings[f"Q8_delete_{label}"] = (
+                        "ok" if e["ok"] else f"HTTP {e.get('status_code')}"
+                    )
 
-        print("Q5: bills")
-        if checking:
-            bill_body = {
-                "status": "pending",
-                "payee": "Probe Electric",
-                "nickname": "electric",
-                "payment_date": (date.today() + timedelta(days=8)).isoformat(),
-                "recurring_date": 25,
-                "payment_amount": 82.5,
-            }
-            p.call("create bill", "POST", f"/accounts/{checking}/bills", bill_body)
-            bills = p.call("list bills", "GET", f"/accounts/{checking}/bills")
-            findings["Q5_bills_listed"] = len(bills) if isinstance(bills, list) else None
-
-    print("Q6: HTTPS")
-    https_url = s.nessie_base_url.replace("http://", "https://", 1)
-    try:
-        r = httpx.get(f"{https_url}/customers", params={"key": key}, timeout=8)
-        findings["Q6_https_status"] = r.status_code
-    except httpx.HTTPError as exc:
-        findings["Q6_https_status"] = f"failed: {type(exc).__name__}"
-
-    out = s.artifacts_dir / "nessie_probe.json"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    text = s.scrub(json.dumps({"findings": findings, "log": p.log}, indent=2, default=str))
-    out.write_text(text, encoding="utf-8")
-
-    print("\nFindings:")
-    for k, v in findings.items():
-        print(f"  {k}: {v}")
-    print(f"\nFull request/response log: {out}")
+    save(s, findings, p.log)
     return 0
 
 

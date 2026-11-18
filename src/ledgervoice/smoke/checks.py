@@ -2,7 +2,7 @@
 
 The checks double as the first measurements of the project: Nessie round-trip time
 (sets the filler-phrase threshold in M4), Cartesia's handling of "fifty" vs "fifteen"
-(the transfer-safety risk), and Moss query latency (the sub-10 ms claim).
+(the transfer-safety risk), and Moss build + query latency.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import wave
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -24,15 +25,21 @@ from ledgervoice.costs import CostLedger
 
 # Contains both "fifty" and "fifteen" on purpose: number confusion is the core STT risk.
 SMOKE_PHRASE = "Please move fifty dollars from checking to savings, not fifteen."
-MOSS_INDEX = "ledgervoice-smoke"
+SAMPLE_RATE = 16_000  # Hz, mono, 16-bit: what STT models expect
+
+# v2: the first index build ("ledgervoice-smoke") was started with plain dicts and never
+# became visible; a fresh name avoids depending on that stuck build.
+MOSS_INDEX = "ledgervoice-smoke-v2"
 MOSS_DOCS = [
-    {"id": "m-coffee", "text": "Blue Door Coffee, espresso bar on Main Street, downtown"},
-    {"id": "m-grocer", "text": "Harvest Market, grocery store in the Westside neighborhood"},
-    {"id": "m-gas", "text": "QuickFuel gas station off Highway 9 near the office park"},
-    {"id": "m-pizza", "text": "Luigi's Pizzeria, takeout pizza on Elm Avenue"},
-    {"id": "m-gym", "text": "IronWorks Gym, monthly membership"},
-    {"id": "m-books", "text": "Chapter House Books, independent bookstore downtown"},
+    ("m-coffee", "Blue Door Coffee, espresso bar on Main Street, downtown"),
+    ("m-grocer", "Harvest Market, grocery store in the Westside neighborhood"),
+    ("m-gas", "QuickFuel gas station off Highway 9 near the office park"),
+    ("m-pizza", "Luigi's Pizzeria, takeout pizza on Elm Avenue"),
+    ("m-gym", "IronWorks Gym, monthly membership"),
+    ("m-books", "Chapter House Books, independent bookstore downtown"),
 ]
+MOSS_BUILD_TIMEOUT_S = 180  # index builds are asynchronous
+MOSS_POLL_INTERVAL_S = 3
 
 
 @dataclass
@@ -54,6 +61,22 @@ def p50(values: list[float]) -> float:
 def normalize_words(text: str) -> set[str]:
     """Lowercase, drop punctuation and '$', split on whitespace. "$50," -> "50"."""
     return set(re.sub(r"[^a-z0-9\s]", " ", text.lower()).split())
+
+
+def pcm_to_wav(pcm: bytes, sample_rate: int = SAMPLE_RATE) -> bytes:
+    """Wrap raw 16-bit mono PCM in a WAV header whose sizes match the actual data.
+
+    Why: a streamed WAV from Cartesia can't know its final length up front, so its header
+    carries a placeholder size (~4 GB). Building the header ourselves keeps durations,
+    cost-ledger audio seconds, and the saved file correct.
+    """
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sample_rate)
+        w.writeframes(pcm)
+    return buf.getvalue()
 
 
 def wav_duration_seconds(data: bytes) -> float:
@@ -84,7 +107,7 @@ def check_nessie(s: Settings, ledger: CostLedger) -> CheckResult:
     ledger.record("nessie", "GET /customers", {"requests": 5}, latency_ms=p50(latencies))
     notes = []
     if s.nessie_base_url.startswith("http://"):
-        notes.append("base URL is plain HTTP: the key travels unencrypted (sandbox key only)")
+        notes.append("base URL is plain HTTP, which Nessie now refuses; use https://")
     return CheckResult(
         "nessie",
         True,
@@ -158,8 +181,8 @@ def check_cartesia_tts(s: Settings, ledger: CostLedger) -> CheckResult:
         "model_id": s.cartesia_tts_model,
         "transcript": SMOKE_PHRASE,
         "voice": {"id": s.cartesia_voice_id},
-        # 16 kHz mono PCM: what STT models expect, and a sensible size for tests.
-        "output_format": {"container": "wav", "encoding": "pcm_s16le", "sample_rate": 16000},
+        # Raw PCM, not WAV: we write the WAV header ourselves (see pcm_to_wav).
+        "output_format": {"container": "raw", "encoding": "pcm_s16le", "sample_rate": SAMPLE_RATE},
         "language": "en",
     }
     t0 = time.perf_counter()
@@ -169,13 +192,13 @@ def check_cartesia_tts(s: Settings, ledger: CostLedger) -> CheckResult:
     latency = ms_since(t0)
     if resp.is_error:
         return CheckResult("cartesia_tts", False, f"HTTP {resp.status_code}: {resp.text[:300]}")
-    audio = resp.content
-    if audio[:4] != b"RIFF":
-        return CheckResult("cartesia_tts", False, f"response is not a WAV file ({audio[:16]!r})")
-    duration = wav_duration_seconds(audio)
+    pcm = resp.content
+    if not pcm or len(pcm) % 2:
+        return CheckResult("cartesia_tts", False, f"unexpected PCM payload ({len(pcm)} bytes)")
+    duration = len(pcm) / (2 * SAMPLE_RATE)
     out = s.artifacts_dir / "smoke_tts.wav"
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_bytes(audio)
+    out.write_bytes(pcm_to_wav(pcm))
     ledger.record(
         "cartesia", "POST /tts/bytes", {"tts_characters": len(SMOKE_PHRASE)}, latency_ms=latency
     )
@@ -227,41 +250,85 @@ def check_cartesia_stt(s: Settings, ledger: CostLedger) -> CheckResult:
 
 
 # --- Moss ------------------------------------------------------------------------
+async def _find_index(client: Any, name: str) -> Any:
+    for idx in await client.list_indexes():
+        if getattr(idx, "name", None) == name:
+            return idx
+    return None
+
+
+def _status(idx: Any) -> str:
+    return str(getattr(idx, "status", "")) if idx is not None else "not listed yet"
+
+
 async def _moss(s: Settings, ledger: CostLedger) -> CheckResult:
-    from moss import MossClient, QueryOptions
+    from moss import DocumentInfo, MossClient, QueryOptions
 
     assert s.moss_project_key is not None
     client = MossClient(s.moss_project_id, s.moss_project_key.get_secret_value())
     notes: list[str] = []
     try:
-        await client.create_index(MOSS_INDEX, MOSS_DOCS)
-    except Exception as exc:  # most likely "already exists" on a re-run; verify in M0
-        notes.append(f"create_index raised {type(exc).__name__}: {s.scrub(str(exc))[:150]}")
-    await client.load_index(MOSS_INDEX)
+        # 1. Build the index only if it isn't already Ready (builds are asynchronous).
+        idx = await _find_index(client, MOSS_INDEX)
+        if _status(idx).lower() == "ready":
+            notes.append(f"index {MOSS_INDEX} already built; reusing it")
+        else:
+            t_build = time.perf_counter()
+            if idx is None:
+                docs = [DocumentInfo(id=doc_id, text=text) for doc_id, text in MOSS_DOCS]
+                try:
+                    await client.create_index(MOSS_INDEX, docs)
+                except Exception as exc:  # e.g. a build from an earlier run is still going
+                    notes.append(f"create_index: {type(exc).__name__}: {s.scrub(str(exc))[:150]}")
+            deadline = time.monotonic() + MOSS_BUILD_TIMEOUT_S
+            while _status(idx).lower() != "ready":
+                if _status(idx).lower() in {"failed", "error"}:
+                    return CheckResult("moss", False, f"index build ended: {_status(idx)}", notes)
+                if time.monotonic() > deadline:
+                    return CheckResult(
+                        "moss",
+                        False,
+                        f"index not ready after {MOSS_BUILD_TIMEOUT_S} s "
+                        f"(last status: {_status(idx)})",
+                        notes,
+                    )
+                await asyncio.sleep(MOSS_POLL_INTERVAL_S)
+                idx = await _find_index(client, MOSS_INDEX)
+            notes.append(
+                f"index build took ~{ms_since(t_build) / 1000:.0f} s "
+                f"(±{MOSS_POLL_INTERVAL_S} s polling granularity)"
+            )
 
-    query = "that coffee place downtown"
-    latencies: list[float] = []
-    results = None
-    for _ in range(20):
-        t0 = time.perf_counter()
-        results = await client.query(MOSS_INDEX, query, QueryOptions(top_k=3))
-        latencies.append(ms_since(t0))
-    assert results is not None
-    ledger.record("moss", "query", {"queries": 20}, latency_ms=p50(latencies))
+        # 2. Load (downloads the index for local querying), then query.
+        t_load = time.perf_counter()
+        await client.load_index(MOSS_INDEX)
+        notes.append(f"load_index took {ms_since(t_load):.0f} ms")
 
-    if not results.docs:
-        return CheckResult("moss", False, "query returned no documents", notes)
-    top = results.docs[0]
-    top_id = getattr(top, "id", None)
-    ok = top_id == "m-coffee" or "Blue Door Coffee" in top.text
-    server_ms = getattr(results, "time_taken_ms", None)
-    return CheckResult(
-        "moss",
-        ok,
-        f"top hit {top.text!r} (score {top.score:.3f}); client-side p50 {p50(latencies):.1f} ms, "
-        f"p95 {sorted(latencies)[18]:.1f} ms over 20 queries; server-reported {server_ms} ms",
-        notes,
-    )
+        query = "that coffee place downtown"
+        latencies: list[float] = []
+        results = None
+        for _ in range(20):
+            t0 = time.perf_counter()
+            results = await client.query(MOSS_INDEX, query, QueryOptions(top_k=3))
+            latencies.append(ms_since(t0))
+        assert results is not None
+        ledger.record("moss", "query", {"queries": 20}, latency_ms=p50(latencies))
+
+        if not results.docs:
+            return CheckResult("moss", False, "query returned no documents", notes)
+        top = results.docs[0]
+        ok = getattr(top, "id", None) == "m-coffee" or "Blue Door Coffee" in top.text
+        server_ms = getattr(results, "time_taken_ms", None)
+        return CheckResult(
+            "moss",
+            ok,
+            f"top hit {top.text!r} (score {top.score:.3f}); client-side p50 "
+            f"{p50(latencies):.1f} ms, p95 {sorted(latencies)[18]:.1f} ms over 20 queries; "
+            f"server-reported {server_ms} ms",
+            notes,
+        )
+    except Exception as exc:  # keep the notes gathered so far
+        return CheckResult("moss", False, s.scrub(f"{type(exc).__name__}: {exc}")[:300], notes)
 
 
 def check_moss(s: Settings, ledger: CostLedger) -> CheckResult:

@@ -39,7 +39,7 @@ class Settings(BaseSettings):
 
     # Nessie
     nessie_api_key: SecretStr | None = None
-    nessie_base_url: str = "http://api.nessieisreal.com"
+    nessie_base_url: str = "https://api.nessieisreal.com"  # plain HTTP is refused
 
     # Moss
     moss_project_id: str | None = None
