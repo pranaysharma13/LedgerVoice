@@ -5,8 +5,13 @@ Every Nessie quirk we found in M0 is handled here, and only here:
 - the server only returns some fields on create, so we merge in what we sent
 - purchases use `purchase_date` (the docs wrongly say transaction_date)
 - merchant `category` is a single string
-- some empty lists come back as 404 "No <things> found for this account"
+- some empty lists come back as 404 "No <things> found for this account" -> []
+- no referential integrity (D36): lists don't check that the account exists, and
+  creates succeed even for an account id that doesn't exist. Callers that need to
+  know whether an account exists must call get_account (the saga and reconcile do).
 - amounts are integers; non-integers would be silently truncated (D16 gate)
+- responses that don't match our models become NessieError, never a raw pydantic
+  error, so callers (and the saga) only ever see BankError subclasses (R1-04)
 """
 
 from __future__ import annotations
@@ -15,10 +20,10 @@ import re
 from datetime import date
 from typing import Any, TypeVar
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from nessie_tools.client import NessieClient
-from nessie_tools.errors import NessieError, NotFoundError
+from nessie_tools.errors import BankError, NessieError, NotFoundError
 from nessie_tools.models import (
     Account,
     AccountType,
@@ -37,7 +42,7 @@ M = TypeVar("M", bound=BaseModel)
 
 # Nessie's way of saying "empty list" on some endpoints, e.g.
 # "No transfers found for this account".
-_EMPTY_LIST_404 = re.compile(r"No \w+ found for this account", re.IGNORECASE)
+_EMPTY_LIST_404 = re.compile(r"No \w+ found for this (account|customer)", re.IGNORECASE)
 
 
 class NessieBackend:
@@ -45,6 +50,20 @@ class NessieBackend:
         self._c = client
 
     # --- helpers ---------------------------------------------------------------
+    @staticmethod
+    def _parse(model: type[M], data: Any, where: str) -> M:
+        """Validate one object; bad data becomes a NessieError, never a pydantic error.
+
+        status_code=None marks it ambiguous: for a create, the server accepted the
+        write before we failed to read the response (R1-04).
+        """
+        try:
+            return model.model_validate(data)
+        except ValidationError as exc:
+            errors = exc.errors()
+            reason = errors[0].get("msg", "invalid") if errors else "invalid"
+            raise NessieError(f"{where}: unexpected {model.__name__} data ({reason})") from None
+
     def _get(self, path: str) -> Any:
         try:
             return self._c.request("GET", path)
@@ -53,7 +72,7 @@ class NessieBackend:
                 raise NotFoundError(f"GET {path}: not found") from None
             raise
 
-    def _list(self, path: str, model: type[M]) -> list[M]:
+    def _list(self, path: str, model: type[M], *, skip_invalid: bool = False) -> list[M]:
         try:
             data = self._c.request("GET", path)
         except NessieError as exc:
@@ -64,7 +83,14 @@ class NessieBackend:
             raise
         if not isinstance(data, list):
             raise NessieError(f"GET {path}: expected a list, got {type(data).__name__}")
-        return [model.model_validate(item) for item in data]
+        items: list[M] = []
+        for item in data:
+            try:
+                items.append(self._parse(model, item, f"GET {path}"))
+            except NessieError:
+                if not skip_invalid:
+                    raise
+        return items
 
     def _create(
         self,
@@ -76,8 +102,14 @@ class NessieBackend:
         """POST and parse the created object.
 
         `known` holds facts we know but did not send (e.g. the owning customer_id).
+        Errors after the server accepted the write are raised as ambiguous.
         """
-        resp = self._c.request("POST", path, json=payload)
+        try:
+            resp = self._c.request("POST", path, json=payload)
+        except NessieError as exc:
+            if exc.status_code == 404:
+                raise NotFoundError(f"POST {path}: parent not found") from None
+            raise
         obj = resp.get("objectCreated") if isinstance(resp, dict) else None
         if not isinstance(obj, dict):
             obj = resp if isinstance(resp, dict) else None
@@ -85,7 +117,7 @@ class NessieBackend:
             raise NessieError(f"POST {path}: response has no created object id")
         # The create response may omit fields; what we sent fills the gaps,
         # and anything the server returned wins.
-        return model.model_validate({**(known or {}), **payload, **obj})
+        return self._parse(model, {**(known or {}), **payload, **obj}, f"POST {path}")
 
     # --- customers -------------------------------------------------------------
     def create_customer(self, first_name: str, last_name: str, address: Address) -> Customer:
@@ -110,14 +142,18 @@ class NessieBackend:
             f"/customers/{customer_id}/accounts", payload, Account, {"customer_id": customer_id}
         )
         if not account.account_number:  # create response may omit it; read it back
-            account = self.get_account(account.id)
+            try:
+                account = self.get_account(account.id)
+            except BankError:
+                pass  # keep the account we have: losing its id would orphan it (R1-19)
         return account
 
     def list_accounts(self, customer_id: str) -> list[Account]:
         return self._list(f"/customers/{customer_id}/accounts", Account)
 
     def get_account(self, account_id: str) -> Account:
-        return Account.model_validate(self._get(f"/accounts/{account_id}"))
+        path = f"/accounts/{account_id}"
+        return self._parse(Account, self._get(path), f"GET {path}")
 
     def delete_account(self, account_id: str) -> None:
         try:
@@ -132,10 +168,12 @@ class NessieBackend:
         return self._create("/merchants", {"name": name, "category": category}, Merchant)
 
     def get_merchant(self, merchant_id: str) -> Merchant:
-        return Merchant.model_validate(self._get(f"/merchants/{merchant_id}"))
+        path = f"/merchants/{merchant_id}"
+        return self._parse(Merchant, self._get(path), f"GET {path}")
 
     def list_merchants(self) -> list[Merchant]:
-        return self._list("/merchants", Merchant)
+        # The merchant list is shared sandbox data: skip entries we can't read.
+        return self._list("/merchants", Merchant, skip_invalid=True)
 
     # --- transactions ----------------------------------------------------------
     def create_purchase(

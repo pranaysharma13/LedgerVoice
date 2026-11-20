@@ -12,6 +12,7 @@ from nessie_tools import (
     NessieClient,
     NessieError,
     NotFoundError,
+    is_ambiguous,
 )
 
 KEY = "fake-test-key-123"  # gitleaks:allow (fake key, used only in offline tests)
@@ -138,3 +139,52 @@ def test_merchant_category_list_from_old_data_is_tolerated():
         return httpx.Response(200, json=[{"_id": "m-1", "name": "Old", "category": ["food"]}])
 
     assert backend_with(handler).list_merchants()[0].category == "food"
+
+
+def test_create_on_unknown_parent_is_not_found():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"message": "Account not found"})
+
+    with pytest.raises(NotFoundError):
+        backend_with(handler).create_deposit("gone", 5, date(2026, 11, 1), "x")
+
+
+def test_unreadable_create_response_is_ambiguous_nessie_error():
+    """R1-04: the server accepted the write; a bad response must not escape as pydantic."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(201, json={"objectCreated": {"_id": "d-1", "amount": "lots"}})
+
+    with pytest.raises(NessieError) as info:
+        backend_with(handler).create_deposit("acc", 5, date(2026, 11, 1), "x")
+    assert is_ambiguous(info.value)
+
+
+def test_bad_shared_merchants_are_skipped():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json=[{"_id": "m-1", "name": None}, {"_id": "m-2", "name": "Good"}]
+        )
+
+    assert [m.name for m in backend_with(handler).list_merchants()] == ["Good"]
+
+
+def test_bad_item_on_our_account_raises():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[{"_id": "p-1", "amount": "lots"}])
+
+    with pytest.raises(NessieError):
+        backend_with(handler).list_purchases("acc")
+
+
+def test_account_kept_when_read_back_fails():
+    """R1-19: never lose the id of an account that was created."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(201, json={"objectCreated": {"_id": "acc-9"}})
+        return httpx.Response(503, text="busy")
+
+    account = backend_with(handler).create_account("cust-1", AccountType.CHECKING, "Main", 0)
+    assert account.id == "acc-9"
+    assert account.account_number == ""

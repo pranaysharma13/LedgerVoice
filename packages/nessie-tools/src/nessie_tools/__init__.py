@@ -25,6 +25,7 @@ from nessie_tools.errors import (
     AmountError,
     BackendFailure,
     BankError,
+    LedgerError,
     NessieError,
     NotFoundError,
     is_ambiguous,
@@ -44,7 +45,7 @@ from nessie_tools.models import (
 )
 from nessie_tools.money import require_whole_dollars
 from nessie_tools.nessie_backend import NessieBackend
-from nessie_tools.reconcile import ReconcileReport, Violation, reconcile
+from nessie_tools.reconcile import ReconcileReport, Violation, ViolationKind, reconcile
 from nessie_tools.transfers import (
     TransferRejected,
     TransferResult,
@@ -68,6 +69,7 @@ __all__ = [
     "Customer",
     "Deposit",
     "FakeBackend",
+    "LedgerError",
     "Merchant",
     "NessieBackend",
     "NessieClient",
@@ -83,6 +85,7 @@ __all__ = [
     "TransferStatus",
     "TxStatus",
     "Violation",
+    "ViolationKind",
     "Withdrawal",
     "compute_balance",
     "is_ambiguous",

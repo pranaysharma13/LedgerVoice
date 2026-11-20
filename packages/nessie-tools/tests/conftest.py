@@ -28,6 +28,7 @@ class Bank:
     checking: Account
     savings: Account
     other_customer_account: Account
+    sleeps: list[float]
 
 
 @pytest.fixture
@@ -35,11 +36,18 @@ def bank():
     fake = FakeBackend(seed=3)
     audit = AuditLog(":memory:")
     ids = iter(f"LV-TRF-{n:08x}" for n in range(1, 1000))
-    service = TransferService(fake, audit, today=lambda: TODAY, new_id=lambda: next(ids))
+    sleeps: list[float] = []
+    service = TransferService(
+        fake,
+        audit,
+        today=lambda: TODAY,
+        new_id=lambda: next(ids),
+        sleep=sleeps.append,  # record the back-off pauses instead of actually waiting
+    )
     alice = fake.create_customer("Alice", "Test", ADDRESS)
     bob = fake.create_customer("Bob", "Other", ADDRESS)
     checking = fake.create_account(alice.id, AccountType.CHECKING, "Checking", 1000)
     savings = fake.create_account(alice.id, AccountType.SAVINGS, "Savings", 500)
     bobs = fake.create_account(bob.id, AccountType.CHECKING, "Bob Checking", 100)
-    yield Bank(fake, audit, service, alice.id, checking, savings, bobs)
+    yield Bank(fake, audit, service, alice.id, checking, savings, bobs, sleeps)
     audit.close()

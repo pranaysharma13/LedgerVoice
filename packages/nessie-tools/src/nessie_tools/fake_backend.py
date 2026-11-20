@@ -3,11 +3,14 @@
 Used by unit tests, the default eval run, and offline development: fast, free and
 resettable. It deliberately copies Nessie's behavior, including the quirks:
 - creating a transaction never changes the account's stored balance
-- deleting an account also removes its transactions and bills
-- unknown ids raise NotFoundError; empty lists are []
+- no referential integrity (D36, verified live 2026-11-20): deleting an account
+  keeps its transactions; transactions and bills can be created for an account id
+  that doesn't exist; listing an unknown account returns what is stored, or []
+- get/delete of an unknown account or merchant raises NotFoundError
 
 It adds one thing Nessie doesn't have: failure injection, so tests can make a
-specific operation fail on purpose (see fail_next).
+specific operation fail on purpose, including a "late write" that lands after the
+caller has already given up and looked (see fail_next).
 """
 
 from __future__ import annotations
@@ -42,6 +45,13 @@ T = TypeVar("T")
 class _PlannedFailure:
     ambiguous: bool
     message: str
+    appears_after_lists: int | None = None
+
+
+@dataclass
+class _LateWrite:
+    remaining_lists: int
+    write: Callable[[], object]
 
 
 @dataclass
@@ -61,31 +71,65 @@ class FakeBackend:
         self._rng = random.Random(seed)
         self._store = _Store()
         self._failures: dict[str, list[_PlannedFailure]] = defaultdict(list)
+        self._late_writes: list[_LateWrite] = []
 
     # --- failure injection (test-only feature) -----------------------------------
-    def fail_next(self, operation: str, *, ambiguous: bool = False) -> None:
+    def fail_next(
+        self,
+        operation: str,
+        *,
+        ambiguous: bool = False,
+        appears_after_lists: int | None = None,
+    ) -> None:
         """Make the next call to `operation` (e.g. "create_deposit") fail.
 
         ambiguous=False: the call fails BEFORE writing anything (like an HTTP 4xx).
         ambiguous=True:  the write HAPPENS, then the call raises (like a timeout after
-                         the server processed the request). The caller can't tell
-                         which one occurred unless it checks.
+                         the server processed the request).
+        appears_after_lists=n: a LATE write. The call raises an ambiguous error
+                         WITHOUT writing; the write appears after n more list_* calls
+                         (any account). Models a server that finishes the request
+                         after the client timed out (R1-02). Use flush_late_writes()
+                         to make all pending late writes land now.
         Calls can be queued: fail_next twice makes the next two calls fail.
         """
         if not hasattr(self, operation):
             raise ValueError(f"unknown operation {operation!r}")
-        label = "after writing (ambiguous)" if ambiguous else "before writing"
-        self._failures[operation].append(
-            _PlannedFailure(ambiguous, f"injected failure in {operation} {label}")
-        )
+        if appears_after_lists is not None:
+            planned = _PlannedFailure(
+                True, f"injected timeout in {operation} (write lands late)", appears_after_lists
+            )
+        else:
+            label = "after writing (ambiguous)" if ambiguous else "before writing"
+            planned = _PlannedFailure(ambiguous, f"injected failure in {operation} {label}")
+        self._failures[operation].append(planned)
+
+    def flush_late_writes(self) -> None:
+        """Apply every pending late write now."""
+        pending, self._late_writes = self._late_writes, []
+        for late in pending:
+            late.write()
 
     def _run(self, operation: str, write: Callable[[], T]) -> T:
         planned = self._failures[operation].pop(0) if self._failures[operation] else None
         if planned is None:
             return write()
-        if planned.ambiguous:
+        if planned.appears_after_lists is not None:
+            self._late_writes.append(_LateWrite(planned.appears_after_lists, write))
+        elif planned.ambiguous:
             write()
         raise BackendFailure(planned.message, ambiguous=planned.ambiguous)
+
+    def _tick_late_writes(self) -> None:
+        """Called at the start of every list_* call: late writes count down and land."""
+        still_pending: list[_LateWrite] = []
+        for late in self._late_writes:
+            if late.remaining_lists <= 0:
+                late.write()
+            else:
+                late.remaining_lists -= 1
+                still_pending.append(late)
+        self._late_writes = still_pending
 
     # --- helpers ---------------------------------------------------------------
     def _new_id(self) -> str:
@@ -138,6 +182,7 @@ class FakeBackend:
         return self._run("create_account", write)
 
     def list_accounts(self, customer_id: str) -> list[Account]:
+        self._tick_late_writes()
         return [a for a in self._store.accounts.values() if a.customer_id == customer_id]
 
     def get_account(self, account_id: str) -> Account:
@@ -147,14 +192,8 @@ class FakeBackend:
         self._require_account(account_id)
 
         def write() -> None:
+            # Like Nessie: the account goes, its transactions and bills stay (orphans).
             del self._store.accounts[account_id]
-            for table in (
-                self._store.purchases,
-                self._store.withdrawals,
-                self._store.deposits,
-                self._store.bills,
-            ):
-                table.pop(account_id, None)
 
         self._run("delete_account", write)
 
@@ -171,6 +210,7 @@ class FakeBackend:
         return self._require_merchant(merchant_id)
 
     def list_merchants(self) -> list[Merchant]:
+        self._tick_late_writes()
         return list(self._store.merchants.values())
 
     # --- transactions ----------------------------------------------------------
@@ -184,7 +224,6 @@ class FakeBackend:
         status: TxStatus = TxStatus.COMPLETED,
     ) -> Purchase:
         amount = require_whole_dollars(amount)
-        self._require_account(account_id)
         self._require_merchant(merchant_id)
 
         def write() -> Purchase:
@@ -202,7 +241,7 @@ class FakeBackend:
         return self._run("create_purchase", write)
 
     def list_purchases(self, account_id: str) -> list[Purchase]:
-        self._require_account(account_id)
+        self._tick_late_writes()
         return list(self._store.purchases[account_id])
 
     def create_withdrawal(
@@ -214,7 +253,6 @@ class FakeBackend:
         status: TxStatus = TxStatus.COMPLETED,
     ) -> Withdrawal:
         amount = require_whole_dollars(amount)
-        self._require_account(account_id)
 
         def write() -> Withdrawal:
             withdrawal = Withdrawal(
@@ -230,7 +268,7 @@ class FakeBackend:
         return self._run("create_withdrawal", write)
 
     def list_withdrawals(self, account_id: str) -> list[Withdrawal]:
-        self._require_account(account_id)
+        self._tick_late_writes()
         return list(self._store.withdrawals[account_id])
 
     def create_deposit(
@@ -242,7 +280,6 @@ class FakeBackend:
         status: TxStatus = TxStatus.COMPLETED,
     ) -> Deposit:
         amount = require_whole_dollars(amount)
-        self._require_account(account_id)
 
         def write() -> Deposit:
             deposit = Deposit(
@@ -258,7 +295,7 @@ class FakeBackend:
         return self._run("create_deposit", write)
 
     def list_deposits(self, account_id: str) -> list[Deposit]:
-        self._require_account(account_id)
+        self._tick_late_writes()
         return list(self._store.deposits[account_id])
 
     # --- bills -----------------------------------------------------------------
@@ -273,7 +310,6 @@ class FakeBackend:
         status: str = "pending",
     ) -> Bill:
         payment_amount = require_whole_dollars(payment_amount)
-        self._require_account(account_id)
 
         def write() -> Bill:
             bill = Bill(
@@ -291,5 +327,5 @@ class FakeBackend:
         return self._run("create_bill", write)
 
     def list_bills(self, account_id: str) -> list[Bill]:
-        self._require_account(account_id)
+        self._tick_late_writes()
         return list(self._store.bills[account_id])

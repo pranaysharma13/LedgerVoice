@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from nessie_tools.backend import BankBackend
-from nessie_tools.models import Deposit, Purchase, TxStatus, Withdrawal
+from nessie_tools.models import Account, Deposit, Purchase, TxStatus, Withdrawal
 
 
 @dataclass(frozen=True)
@@ -36,8 +36,12 @@ def _completed_total(items: list[Deposit] | list[Withdrawal] | list[Purchase]) -
     return sum(item.amount for item in items if item.status is TxStatus.COMPLETED)
 
 
-def compute_balance(backend: BankBackend, account_id: str) -> Balance:
-    account = backend.get_account(account_id)
+def compute_balance(
+    backend: BankBackend, account_id: str, *, account: Account | None = None
+) -> Balance:
+    """Compute the current balance. Pass `account` if you already fetched it (saves a call)."""
+    if account is None or account.id != account_id:
+        account = backend.get_account(account_id)
     return Balance(
         account_id=account_id,
         opening=account.balance,

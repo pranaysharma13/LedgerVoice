@@ -11,9 +11,12 @@ Two implementations:
 
 Rules shared by both:
 - Every amount passes require_whole_dollars() before anything is stored (D16).
-- Unknown ids raise NotFoundError.
+- get_account / get_merchant / delete_account on an unknown id raise NotFoundError.
 - List operations on an account with no items return [].
 - Creating a transaction never changes the account's stored balance (Nessie quirk).
+- No referential integrity (D36, Nessie quirk): creates and lists do NOT check that
+  the account exists, and deleting an account keeps its transactions. Code that must
+  know whether an account exists calls get_account explicitly.
 """
 
 from __future__ import annotations

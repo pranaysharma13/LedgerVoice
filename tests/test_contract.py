@@ -67,21 +67,32 @@ def world(request: pytest.FixtureRequest) -> Iterator[World]:
     else:
         backend, client = _live_backend()
 
-    customer = backend.create_customer("Casey", "Contract", ADDRESS)
-    checking = backend.create_account(customer.id, AccountType.CHECKING, "Contract Checking", 1000)
-    savings = backend.create_account(customer.id, AccountType.SAVINGS, "Contract Savings", 500)
-    existing = [m for m in backend.list_merchants() if m.name == CONTRACT_MERCHANT]
-    merchant = existing[0] if existing else backend.create_merchant(CONTRACT_MERCHANT, "coffee")
+    created: list[Account] = []
     try:
-        yield World(backend, checking, savings, merchant)
+        customer = backend.create_customer("Casey", "Contract", ADDRESS)
+        created.append(
+            backend.create_account(customer.id, AccountType.CHECKING, "Contract Checking", 1000)
+        )
+        created.append(
+            backend.create_account(customer.id, AccountType.SAVINGS, "Contract Savings", 500)
+        )
+        existing = [m for m in backend.list_merchants() if m.name == CONTRACT_MERCHANT]
+        merchant = existing[0] if existing else backend.create_merchant(CONTRACT_MERCHANT, "coffee")
+        yield World(backend, created[0], created[1], merchant)
     finally:
-        for account in (checking, savings):
+        for account in created:  # setup is inside the try: nothing leaks (R1-17)
             try:
                 backend.delete_account(account.id)
             except NotFoundError:
                 pass  # a test already deleted it
         if client is not None:
             client.close()
+
+
+def _fresh_account(world: World) -> Account:
+    return world.backend.create_account(
+        world.checking.customer_id, AccountType.SAVINGS, "Contract Temp", 0
+    )
 
 
 def test_accounts_round_trip(world: World) -> None:
@@ -96,11 +107,20 @@ def test_accounts_round_trip(world: World) -> None:
 
 
 def test_new_account_lists_are_empty(world: World) -> None:
-    b, acc = world.backend, world.savings.id
-    assert b.list_purchases(acc) == []
-    assert b.list_withdrawals(acc) == []
-    assert b.list_deposits(acc) == []
-    assert b.list_bills(acc) == []
+    b = world.backend
+    acc = _fresh_account(world).id  # its own account: no dependence on test order
+    try:
+        assert b.list_purchases(acc) == []
+        assert b.list_withdrawals(acc) == []
+        assert b.list_deposits(acc) == []
+        assert b.list_bills(acc) == []
+    finally:
+        b.delete_account(acc)
+
+
+def test_customer_without_accounts_lists_empty(world: World) -> None:
+    customer = world.backend.create_customer("Nolan", "Noaccounts", ADDRESS)
+    assert world.backend.list_accounts(customer.id) == []
 
 
 def test_merchant_category_is_a_string(world: World) -> None:
@@ -162,7 +182,32 @@ def test_unknown_account_is_not_found(world: World) -> None:
 
 def test_delete_account(world: World) -> None:
     b = world.backend
-    extra = b.create_account(world.checking.customer_id, AccountType.SAVINGS, "Temp", 0)
+    extra = _fresh_account(world)
     b.delete_account(extra.id)
     with pytest.raises(NotFoundError):
         b.get_account(extra.id)
+
+
+def test_deleting_an_account_keeps_its_transactions(world: World) -> None:
+    """D36 (verified live 2026-11-20): no referential integrity. The account goes away,
+    its transactions stay, and listing them still works. Reconcile relies on this to
+    keep checking legs of deleted accounts."""
+    b = world.backend
+    extra = _fresh_account(world)
+    deposit = b.create_deposit(extra.id, 5, DAY, "before delete")
+    b.delete_account(extra.id)
+    with pytest.raises(NotFoundError):
+        b.get_account(extra.id)
+    assert [d.id for d in b.list_deposits(extra.id)] == [deposit.id]  # orphaned, still listed
+    assert b.list_withdrawals(extra.id) == []
+
+
+def test_bank_accepts_transactions_for_unknown_accounts(world: World) -> None:
+    """D36: Nessie stores a deposit for an account id that never existed. This is why
+    the saga checks both accounts with get_account before writing any leg."""
+    b = world.backend
+    ghost = str(uuid.uuid4())
+    deposit = b.create_deposit(ghost, 5, DAY, "to nowhere")
+    assert [d.id for d in b.list_deposits(ghost)] == [deposit.id]
+    with pytest.raises(NotFoundError):
+        b.get_account(ghost)

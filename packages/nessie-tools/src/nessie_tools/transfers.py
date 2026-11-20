@@ -1,5 +1,12 @@
 """Transfers between a customer's own accounts, run as a saga (decision D15).
 
+Two-step API (R1-01, decision D34): there is NO way to move money in one call.
+    create_pending(...)        pre-checks, then records a PENDING transfer; no money moves
+    execute_pending(id)        runs an existing PENDING transfer, and nothing else
+    cancel_pending(id, ...)    PENDING -> CANCELLED or EXPIRED
+The confirmation flow (M1d) sits between the two steps: only a user's explicit yes,
+checked by code, leads to execute_pending. An unknown or invented id is rejected.
+
 Nessie transfers have no destination field, so a transfer is two writes:
     leg 1: withdrawal from the source account
     leg 2: deposit into the destination account
@@ -8,29 +15,38 @@ which is how reconcile.py ties bank records back to the audit log.
 
 A saga is a sequence of steps where each step that can fail after an earlier step
 succeeded has a COMPENSATING action that undoes the earlier step:
-- leg 1 fails          -> nothing moved: FAILED
-- leg 2 fails          -> reversing deposit into the source: COMPENSATED
-- reversal also fails  -> NEEDS_ATTENTION (a human must look; reconcile flags it)
+- leg 1 definitely not written   -> nothing moved: FAILED
+- leg 2 definitely not written   -> reversing deposit into the source: COMPENSATED
+- reversal not written           -> NEEDS_ATTENTION (a human must look)
 
-Ambiguous outcomes: a timeout or 5xx can happen AFTER the bank wrote the leg. Nessie
-has no idempotency keys, so blindly retrying could withdraw twice. Instead we look
-the leg up by its exact description before deciding (see _verify_or_write).
+Ambiguous outcomes (R1-02, decision D33): a timeout or 5xx can happen while the bank
+is still processing the write, and the write can land AFTER we look for it. So:
+- a rejection (4xx) means "definitely not written";
+- an ambiguous error triggers a few re-checks with short pauses, looking the leg up
+  by its exact description;
+- if it is still not found, the outcome is UNKNOWN and the transfer goes to
+  NEEDS_ATTENTION. We never conclude FAILED, and never compensate, on a guess.
 
-This module does not decide whether a transfer is ALLOWED for the user (that is the
-confirmation flow in M1d). It does re-check the basics as defense in depth.
+Known limitation (R1-12, accepted): if the local audit write itself fails right after
+a bank write (e.g. disk full), the exception propagates and the record stays in
+EXECUTING or LEG1_DONE. reconcile reports it as stuck_in_progress.
 """
 
 from __future__ import annotations
 
 import secrets
-from collections.abc import Callable
+import threading
+import time
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date
+from typing import Literal
 
 from nessie_tools.audit import AuditLog, TransferRecord, TransferStatus
 from nessie_tools.backend import BankBackend
 from nessie_tools.balances import compute_balance
-from nessie_tools.errors import BankError, is_ambiguous
+from nessie_tools.errors import BankError, LedgerError, is_ambiguous
 from nessie_tools.models import Account, Deposit, Withdrawal
 from nessie_tools.money import require_whole_dollars
 
@@ -40,6 +56,11 @@ TRANSFER_ID_PREFIX = "LV-TRF-"
 LEG1_MARKER = "(leg 1/2)"
 LEG2_MARKER = "(leg 2/2)"
 REVERSAL_MARKER = "(reversal of leg 1/2)"
+
+# Pauses before each look-up after an ambiguous write: first look immediately,
+# then wait a little longer each time (~3.5 s worst case).
+DEFAULT_RECHECK_DELAYS: tuple[float, ...] = (0.0, 0.5, 1.0, 2.0)
+DETAIL_MAX = 200
 
 
 def new_transfer_id() -> str:
@@ -58,8 +79,8 @@ def reversal_description(transfer_id: str) -> str:
     return f"{transfer_id} {REVERSAL_MARKER}"
 
 
-class TransferRejected(BankError):
-    """A pre-check failed. Nothing was written to the bank or the audit log."""
+class TransferRejected(LedgerError):
+    """A check failed before any money moved. The bank was not written to."""
 
 
 @dataclass(frozen=True)
@@ -69,11 +90,20 @@ class TransferResult:
     amount: int
     from_last4: str
     to_last4: str
-    message: str  # short, user-facing summary
+    message: str  # short, user-facing, written to be spoken aloud
 
     @property
     def succeeded(self) -> bool:
         return self.status is TransferStatus.COMPLETED
+
+
+@dataclass(frozen=True)
+class _Outcome:
+    """Result of trying to write one leg."""
+
+    kind: Literal["written", "not_written", "unknown"]
+    leg: Withdrawal | Deposit | None = None
+    reason: str = ""
 
 
 class TransferService:
@@ -83,95 +113,206 @@ class TransferService:
         audit: AuditLog,
         today: Callable[[], date] = date.today,
         new_id: Callable[[], str] = new_transfer_id,
+        recheck_delays: Sequence[float] = DEFAULT_RECHECK_DELAYS,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._bank = backend
         self._audit = audit
         self._today = today
         self._new_id = new_id
+        self._recheck_delays = tuple(recheck_delays)
+        self._sleep = sleep
+        # One lock per source account: the balance check and the writes for the same
+        # account never interleave, so two transfers can't both spend the same money.
+        self._locks: dict[str, threading.Lock] = {}
+        self._locks_guard = threading.Lock()
 
-    # --- public ----------------------------------------------------------------
-    def execute(
-        self,
-        customer_id: str,
-        from_account_id: str,
-        to_account_id: str,
-        amount: int,
-        transfer_id: str | None = None,
-    ) -> TransferResult:
-        """Run a transfer. Raises TransferRejected if a pre-check fails.
+    # --- step 1: propose ---------------------------------------------------------
+    def create_pending(
+        self, customer_id: str, from_account_id: str, to_account_id: str, amount: int
+    ) -> TransferRecord:
+        """Run the pre-checks and record a PENDING transfer. No money moves.
 
-        If `transfer_id` names an existing PENDING record (created by the confirmation
-        flow), that record is executed; it must match these accounts and amount.
+        Raises TransferRejected if a check fails (nothing is recorded).
         """
         amount = self._require_amount(amount)
-        src, dst = self._check_accounts(customer_id, from_account_id, to_account_id)
-        try:
-            available = compute_balance(self._bank, src.id).current
-        except BankError as exc:
-            raise TransferRejected(f"could not read the balance: {exc}") from None
-        if amount > available:
-            raise TransferRejected(f"insufficient funds: ${available} available")
-
-        record = self._begin(transfer_id, customer_id, src.id, dst.id, amount)
-        tid = record.transfer_id
-        when = self._today()
-
-        # --- leg 1: withdrawal ----------------------------------------------------
-        desc1 = leg1_description(tid, dst.last4)
-        try:
-            leg1 = self._verify_or_write(
-                lambda: self._bank.create_withdrawal(src.id, amount, when, desc1),
-                lambda: self._bank.list_withdrawals(src.id),
-                desc1,
-                amount,
-            )
-        except _Unverifiable as exc:
-            return self._finish(tid, S.NEEDS_ATTENTION, f"leg 1 outcome unknown: {exc}", src, dst)
-        if leg1 is None:
-            return self._finish(tid, S.FAILED, "leg 1 (withdrawal) failed", src, dst)
-        self._audit.transition(tid, S.LEG1_DONE, detail="withdrawal written", withdrawal_id=leg1.id)
-
-        # --- leg 2: deposit -------------------------------------------------------
-        desc2 = leg2_description(tid, src.last4)
-        try:
-            leg2 = self._verify_or_write(
-                lambda: self._bank.create_deposit(dst.id, amount, when, desc2),
-                lambda: self._bank.list_deposits(dst.id),
-                desc2,
-                amount,
-            )
-        except _Unverifiable as exc:
-            return self._finish(tid, S.NEEDS_ATTENTION, f"leg 2 outcome unknown: {exc}", src, dst)
-        if leg2 is not None:
-            return self._finish(tid, S.COMPLETED, "deposit written", src, dst, deposit_id=leg2.id)
-
-        # --- compensation: put the money back -------------------------------------
-        desc_r = reversal_description(tid)
-        try:
-            reversal = self._verify_or_write(
-                lambda: self._bank.create_deposit(src.id, amount, when, desc_r),
-                lambda: self._bank.list_deposits(src.id),
-                desc_r,
-                amount,
-            )
-        except _Unverifiable as exc:
-            reversal = None
-            detail = f"leg 2 failed; reversal outcome unknown: {exc}"
-        else:
-            detail = "leg 2 failed; reversal failed"
-        if reversal is None:
-            return self._finish(tid, S.NEEDS_ATTENTION, detail, src, dst)
-        return self._finish(
-            tid, S.COMPENSATED, "leg 2 failed; reversal written", src, dst, reversal_id=reversal.id
+        src, _dst = self._check_accounts(customer_id, from_account_id, to_account_id)
+        self._check_funds(src, amount)
+        return self._audit.create(
+            self._new_id(), customer_id, from_account_id, to_account_id, amount, status=S.PENDING
         )
 
-    # --- steps -----------------------------------------------------------------
+    def cancel_pending(
+        self, transfer_id: str, *, expired: bool = False, reason: str = ""
+    ) -> TransferRecord:
+        """PENDING -> CANCELLED (or EXPIRED). Raises TransferRejected if not PENDING."""
+        record = self._require_pending(transfer_id)
+        status = S.EXPIRED if expired else S.CANCELLED
+        return self._audit.transition(record.transfer_id, status, detail=_clip(reason))
+
+    # --- step 2: execute ---------------------------------------------------------
+    def execute_pending(self, transfer_id: str) -> TransferResult:
+        """Run an existing PENDING transfer. Anything else is rejected.
+
+        Accounts and funds are checked again, because things may have changed since
+        the transfer was proposed; if a check fails now, the transfer is CANCELLED and
+        TransferRejected is raised. Otherwise a TransferResult is returned.
+        """
+        record = self._require_pending(transfer_id)
+        with self._account_lock(record.from_account):
+            record = self._require_pending(transfer_id)  # re-read under the lock
+            try:
+                src, dst = self._check_accounts(
+                    record.customer_id, record.from_account, record.to_account
+                )
+                self._check_funds(src, record.amount)
+            except TransferRejected as exc:
+                self._audit.transition(
+                    transfer_id, S.CANCELLED, detail=_clip(f"checks failed at execution: {exc}")
+                )
+                raise
+            self._audit.transition(transfer_id, S.EXECUTING, detail="confirmed; executing")
+            return self._run_legs(record, src, dst)
+
+    # --- the saga ------------------------------------------------------------------
+    def _run_legs(self, record: TransferRecord, src: Account, dst: Account) -> TransferResult:
+        tid, amount, when = record.transfer_id, record.amount, self._today()
+
+        # leg 1: withdrawal
+        desc1 = leg1_description(tid, dst.last4)
+        leg1 = self._write_leg(
+            lambda: self._bank.create_withdrawal(src.id, amount, when, desc1),
+            lambda: self._bank.list_withdrawals(src.id),
+            desc1,
+            amount,
+        )
+        if leg1.kind == "not_written":
+            return self._finish(tid, S.FAILED, f"leg 1 rejected: {leg1.reason}", src, dst)
+        if leg1.kind == "unknown" or leg1.leg is None:
+            return self._finish(
+                tid, S.NEEDS_ATTENTION, f"leg 1 outcome unknown: {leg1.reason}", src, dst
+            )
+        self._audit.transition(
+            tid, S.LEG1_DONE, detail="withdrawal written", withdrawal_id=leg1.leg.id
+        )
+
+        # leg 2: deposit
+        desc2 = leg2_description(tid, src.last4)
+        leg2 = self._write_leg(
+            lambda: self._bank.create_deposit(dst.id, amount, when, desc2),
+            lambda: self._bank.list_deposits(dst.id),
+            desc2,
+            amount,
+        )
+        if leg2.kind == "written" and leg2.leg is not None:
+            return self._finish(
+                tid, S.COMPLETED, "deposit written", src, dst, deposit_id=leg2.leg.id
+            )
+        if leg2.kind == "unknown":
+            # Leg 2 may still land: compensating now could create money. Stop here.
+            return self._finish(
+                tid, S.NEEDS_ATTENTION, f"leg 2 outcome unknown: {leg2.reason}", src, dst
+            )
+
+        # compensation: leg 2 was definitely not written, so put the money back
+        desc_r = reversal_description(tid)
+        reversal = self._write_leg(
+            lambda: self._bank.create_deposit(src.id, amount, when, desc_r),
+            lambda: self._bank.list_deposits(src.id),
+            desc_r,
+            amount,
+        )
+        if reversal.kind == "written" and reversal.leg is not None:
+            return self._finish(
+                tid,
+                S.COMPENSATED,
+                f"leg 2 rejected: {leg2.reason}; reversal written",
+                src,
+                dst,
+                reversal_id=reversal.leg.id,
+            )
+        return self._finish(
+            tid,
+            S.NEEDS_ATTENTION,
+            f"leg 2 rejected: {leg2.reason}; reversal {reversal.kind}: {reversal.reason}",
+            src,
+            dst,
+        )
+
+    def _write_leg(
+        self,
+        write: Callable[[], Withdrawal | Deposit],
+        list_existing: Callable[[], list[Withdrawal] | list[Deposit]],
+        description: str,
+        amount: int,
+    ) -> _Outcome:
+        """Write one leg and classify the outcome as written / not_written / unknown."""
+        try:
+            return _Outcome("written", write())
+        except BankError as exc:
+            if not is_ambiguous(exc):
+                return _Outcome("not_written", reason=_clip(str(exc)))
+            first_error = _clip(str(exc))
+        # Ambiguous: the write may have landed, or may still land. Look a few times.
+        last_check_error = ""
+        for delay in self._recheck_delays:
+            if delay:
+                self._sleep(delay)
+            try:
+                for leg in list_existing():
+                    if leg.description == description and leg.amount == amount:
+                        return _Outcome("written", leg)
+            except BankError as check_exc:
+                last_check_error = _clip(str(check_exc))
+        note = f"{first_error}; not found after {len(self._recheck_delays)} checks"
+        if last_check_error:
+            note += f" (last check failed: {last_check_error})"
+        return _Outcome("unknown", reason=_clip(note))
+
+    def _finish(
+        self,
+        tid: str,
+        status: TransferStatus,
+        detail: str,
+        src: Account,
+        dst: Account,
+        *,
+        deposit_id: str | None = None,
+        reversal_id: str | None = None,
+    ) -> TransferResult:
+        record = self._audit.transition(
+            tid, status, detail=_clip(detail), deposit_id=deposit_id, reversal_id=reversal_id
+        )
+        amount = record.amount
+        frm, to = f"account ending in {src.last4}", f"account ending in {dst.last4}"
+        messages = {
+            S.COMPLETED: f"Done. I moved ${amount} from your {frm} to your {to}.",
+            S.FAILED: "The transfer didn't go through, so no money moved.",
+            S.COMPENSATED: (
+                f"The transfer failed partway, so the ${amount} was returned to your {frm}."
+            ),
+            S.NEEDS_ATTENTION: (
+                "Something went wrong and I can't confirm whether the money moved. "
+                f"It needs a manual check. The reference is {tid}."
+            ),
+        }
+        return TransferResult(tid, status, amount, src.last4, dst.last4, messages[status])
+
+    # --- checks ------------------------------------------------------------------
     @staticmethod
     def _require_amount(amount: int) -> int:
         try:
             return require_whole_dollars(amount)
         except BankError as exc:
             raise TransferRejected(str(exc)) from None
+
+    def _require_pending(self, transfer_id: str) -> TransferRecord:
+        record = self._audit.find(transfer_id)
+        if record is None:
+            raise TransferRejected(f"no transfer {transfer_id!r} is waiting for confirmation")
+        if record.status is not S.PENDING:
+            raise TransferRejected(f"{transfer_id} is {record.status}, not PENDING")
+        return record
 
     def _check_accounts(
         self, customer_id: str, from_account_id: str, to_account_id: str
@@ -187,83 +328,22 @@ class TransferService:
             raise TransferRejected("both accounts must belong to the customer")
         return src, dst
 
-    def _begin(
-        self,
-        transfer_id: str | None,
-        customer_id: str,
-        from_id: str,
-        to_id: str,
-        amount: int,
-    ) -> TransferRecord:
-        existing = self._audit.find(transfer_id) if transfer_id else None
-        if existing is None:
-            return self._audit.create(
-                transfer_id or self._new_id(), customer_id, from_id, to_id, amount
-            )
-        if existing.status is not S.PENDING:
-            raise TransferRejected(f"{existing.transfer_id} is {existing.status}, not PENDING")
-        if (existing.customer_id, existing.from_account, existing.to_account, existing.amount) != (
-            customer_id,
-            from_id,
-            to_id,
-            amount,
-        ):
-            raise TransferRejected(f"{existing.transfer_id} does not match the pending transfer")
-        return self._audit.transition(existing.transfer_id, S.EXECUTING, detail="confirmed")
-
-    def _verify_or_write(
-        self,
-        write: Callable[[], Withdrawal | Deposit],
-        list_existing: Callable[[], list[Withdrawal] | list[Deposit]],
-        description: str,
-        amount: int,
-    ) -> Withdrawal | Deposit | None:
-        """Write one leg. Returns the leg, or None if it definitely was NOT written.
-
-        Raises _Unverifiable if the write was ambiguous and the check also failed.
-        """
+    def _check_funds(self, src: Account, amount: int) -> None:
         try:
-            return write()
+            available = compute_balance(self._bank, src.id, account=src).current
         except BankError as exc:
-            if not is_ambiguous(exc):
-                return None  # the bank rejected it: nothing was written
-            try:
-                matches = [
-                    leg
-                    for leg in list_existing()
-                    if leg.description == description and leg.amount == amount
-                ]
-            except BankError as check_exc:
-                raise _Unverifiable(str(check_exc)) from None
-            return matches[0] if matches else None
+            raise TransferRejected(f"could not read the balance: {exc}") from None
+        if amount > available:
+            raise TransferRejected(f"insufficient funds: ${available} available")
 
-    def _finish(
-        self,
-        tid: str,
-        status: TransferStatus,
-        detail: str,
-        src: Account,
-        dst: Account,
-        *,
-        deposit_id: str | None = None,
-        reversal_id: str | None = None,
-    ) -> TransferResult:
-        record = self._audit.transition(
-            tid, status, detail=detail, deposit_id=deposit_id, reversal_id=reversal_id
-        )
-        amount = record.amount
-        messages = {
-            S.COMPLETED: f"Moved ${amount} from ••{src.last4} to ••{dst.last4}.",
-            S.FAILED: "The transfer didn't go through. No money moved.",
-            S.COMPENSATED: (
-                f"The transfer failed partway, so the ${amount} was returned to ••{src.last4}."
-            ),
-            S.NEEDS_ATTENTION: (
-                f"The transfer hit an error and needs a manual check. Reference {tid}."
-            ),
-        }
-        return TransferResult(tid, status, amount, src.last4, dst.last4, messages[status])
+    @contextmanager
+    def _account_lock(self, account_id: str) -> Iterator[None]:
+        with self._locks_guard:
+            lock = self._locks.setdefault(account_id, threading.Lock())
+        with lock:
+            yield
 
 
-class _Unverifiable(Exception):
-    """An ambiguous write whose outcome could not be checked either."""
+def _clip(text: str) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= DETAIL_MAX else text[: DETAIL_MAX - 1] + "…"

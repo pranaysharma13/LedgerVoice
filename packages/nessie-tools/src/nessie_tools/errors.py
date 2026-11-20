@@ -1,15 +1,23 @@
 """Error types for nessie-tools.
 
-Every error raised by this package is a BankError, so callers can catch one type.
-The subclasses tell the caller what kind of failure it was, which matters for the
-transfer saga: some failures definitely changed nothing, others may have.
+Two families, so callers can tell them apart (R1-21):
+- BankError:   something went wrong talking to the bank, or a value the bank can't
+               store (AmountError). The subclasses tell the saga whether a failed
+               write definitely changed nothing, or may have.
+- LedgerError: our own rules said no: a transfer was rejected (TransferRejected) or
+               an audit-log operation was invalid (AuditError). Defined in
+               transfers.py and audit.py.
 """
 
 from __future__ import annotations
 
 
 class BankError(Exception):
-    """Base class for every error raised by nessie-tools."""
+    """Base class for bank and transport errors."""
+
+
+class LedgerError(Exception):
+    """Base class for errors raised by our own rules (rejections, audit misuse)."""
 
 
 class NessieError(BankError):
@@ -46,12 +54,15 @@ def is_ambiguous(exc: BaseException) -> bool:
     """True if a failed write MAY have taken effect, so it must be checked, not retried.
 
     - Injected failures say so explicitly.
-    - A Nessie error with no HTTP status (timeout, dropped connection) or a 5xx may
-      have been processed by the server before the error.
+    - A Nessie error with no HTTP status (timeout, dropped connection, unreadable
+      response) or a 5xx may have been processed by the server before the error.
+    - A 2xx means the server ACCEPTED the write; the error came afterwards (e.g. a
+      body we couldn't parse), so it was very likely written (R1-03).
     - A 4xx means the server rejected the request: nothing was written.
     """
     if isinstance(exc, BackendFailure):
         return exc.ambiguous
     if isinstance(exc, NessieError):
-        return exc.status_code is None or exc.status_code >= 500
+        code = exc.status_code
+        return code is None or code >= 500 or 200 <= code < 300
     return False

@@ -1,15 +1,19 @@
-"""The transfer saga: happy path, every failure branch, and pre-checks."""
+"""The transfer saga: the two-step API, every outcome branch, pre-checks, concurrency."""
+
+import threading
 
 import pytest
 from nessie_tools import (
     NessieError,
     TransferRejected,
     TransferStatus,
+    ViolationKind,
     compute_balance,
     reconcile,
 )
 
 S = TransferStatus
+V = ViolationKind
 
 
 def balances(bank):
@@ -19,26 +23,46 @@ def balances(bank):
     )
 
 
-def transfer(bank, amount=50, **kw):
-    return bank.service.execute(bank.customer_id, bank.checking.id, bank.savings.id, amount, **kw)
+def propose(bank, amount=50):
+    return bank.service.create_pending(bank.customer_id, bank.checking.id, bank.savings.id, amount)
+
+
+def transfer(bank, amount=50):
+    """Propose + execute: the only way money can move."""
+    return bank.service.execute_pending(propose(bank, amount).transfer_id)
 
 
 def history(bank, tid):
     return [e.status for e in bank.audit.events(tid)]
 
 
+def last_detail(bank, tid):
+    return bank.audit.events(tid)[-1].detail
+
+
+def report(bank):
+    return reconcile(bank.fake, bank.audit, [bank.checking.id, bank.savings.id])
+
+
 def assert_reconciles(bank):
-    report = reconcile(bank.fake, bank.audit, [bank.checking.id, bank.savings.id])
-    assert report.ok, report.violations
+    r = report(bank)
+    assert r.ok, r.violations
 
 
-# --- happy path ------------------------------------------------------------------
+# --- the two-step API (R1-01) ------------------------------------------------------
+def test_propose_moves_no_money(bank):
+    record = propose(bank)
+    assert record.status is S.PENDING
+    assert balances(bank) == (1000, 500)
+    assert bank.fake.list_withdrawals(bank.checking.id) == []
+
+
 def test_completed_transfer_moves_money(bank):
     result = transfer(bank)
     assert result.status is S.COMPLETED and result.succeeded
     assert balances(bank) == (950, 550)
-    assert history(bank, result.transfer_id) == [S.EXECUTING, S.LEG1_DONE, S.COMPLETED]
-    assert f"••{bank.checking.last4}" in result.message
+    assert history(bank, result.transfer_id) == [S.PENDING, S.EXECUTING, S.LEG1_DONE, S.COMPLETED]
+    assert f"account ending in {bank.checking.last4}" in result.message  # spoken, not "••"
     assert_reconciles(bank)
 
 
@@ -49,62 +73,135 @@ def test_legs_carry_the_transfer_id(bank):
     assert w.description.startswith(tid) and d.description.startswith(tid)
 
 
-# --- leg 1 failures --------------------------------------------------------------
+@pytest.mark.parametrize("bad_id", ["LV-TRF-0badc0de", "LV-TRF-hallucinated", "confirm 42", ""])
+def test_unknown_or_invented_id_moves_nothing(bank, bad_id):
+    with pytest.raises(TransferRejected):
+        bank.service.execute_pending(bad_id)
+    assert bank.audit.records() == []
+    assert balances(bank) == (1000, 500)
+
+
+def test_finished_transfer_cannot_run_again(bank):
+    tid = transfer(bank).transfer_id
+    with pytest.raises(TransferRejected):
+        bank.service.execute_pending(tid)
+    assert len(bank.fake.list_withdrawals(bank.checking.id)) == 1
+
+
+def test_cancelled_and_expired_transfers_cannot_run(bank):
+    a, b = propose(bank), propose(bank, 20)
+    bank.service.cancel_pending(a.transfer_id, reason="user said no")
+    bank.service.cancel_pending(b.transfer_id, expired=True)
+    assert bank.audit.get(a.transfer_id).status is S.CANCELLED
+    assert bank.audit.get(b.transfer_id).status is S.EXPIRED
+    for tid in (a.transfer_id, b.transfer_id):
+        with pytest.raises(TransferRejected):
+            bank.service.execute_pending(tid)
+    assert balances(bank) == (1000, 500)
+    assert_reconciles(bank)
+
+
+def test_cancel_requires_pending(bank):
+    tid = transfer(bank).transfer_id
+    with pytest.raises(TransferRejected):
+        bank.service.cancel_pending(tid)
+
+
+def test_funds_rechecked_at_execution(bank):
+    """Proposed while affordable; by the time the user says yes, it no longer is."""
+    first, second = propose(bank, 600), propose(bank, 600)
+    assert bank.service.execute_pending(first.transfer_id).succeeded
+    with pytest.raises(TransferRejected, match="insufficient"):
+        bank.service.execute_pending(second.transfer_id)
+    assert bank.audit.get(second.transfer_id).status is S.CANCELLED
+    assert balances(bank) == (400, 1100)
+
+
+# --- leg 1 outcomes ----------------------------------------------------------------
 def test_leg1_rejected_means_nothing_moved(bank):
     bank.fake.fail_next("create_withdrawal")
     result = transfer(bank)
     assert result.status is S.FAILED
     assert balances(bank) == (1000, 500)
+    assert "injected failure" in last_detail(bank, result.transfer_id)  # reason recorded
     assert_reconciles(bank)
 
 
 def test_leg1_ambiguous_but_written_is_not_duplicated(bank):
-    bank.fake.fail_next("create_withdrawal", ambiguous=True)  # written, then "timeout"
+    bank.fake.fail_next("create_withdrawal", ambiguous=True)
     result = transfer(bank)
     assert result.status is S.COMPLETED
-    assert len(bank.fake.list_withdrawals(bank.checking.id)) == 1  # no double withdrawal
-    assert balances(bank) == (950, 550)
+    assert len(bank.fake.list_withdrawals(bank.checking.id)) == 1
     assert_reconciles(bank)
 
 
-def test_leg1_timeout_without_write_is_a_clean_failure(bank, monkeypatch):
-    def timeout(*args, **kwargs):
-        raise NessieError("ReadTimeout")  # no status code: ambiguous
-
-    monkeypatch.setattr(bank.fake, "create_withdrawal", timeout)
+def test_leg1_late_write_found_on_a_recheck(bank):
+    bank.fake.fail_next("create_withdrawal", appears_after_lists=2)
     result = transfer(bank)
-    assert result.status is S.FAILED  # checked: nothing was written
-    assert balances(bank) == (1000, 500)
+    assert result.status is S.COMPLETED
+    assert len(bank.fake.list_withdrawals(bank.checking.id)) == 1
+    assert bank.sleeps  # it waited between checks
+    assert_reconciles(bank)
+
+
+def test_leg1_late_write_never_seen_is_needs_attention_not_failed(bank):
+    """R1-02: 'not found yet' is not 'not written'. Never tell the user no money moved."""
+    bank.fake.fail_next("create_withdrawal", appears_after_lists=100)
+    result = transfer(bank)
+    assert result.status is S.NEEDS_ATTENTION
+    assert "can't confirm" in result.message and result.transfer_id in result.message
+    bank.fake.flush_late_writes()  # the write lands after all
+    assert balances(bank) == (950, 500)  # which is exactly why FAILED would have been a lie
+    assert bank.sleeps == [0.5, 1.0, 2.0]
 
 
 def test_leg1_unverifiable_needs_attention(bank, monkeypatch):
     def timeout(*args, **kwargs):
         raise NessieError("ReadTimeout")
 
+    attempted = []
     real_list = bank.fake.list_withdrawals
-    calls = []
 
-    def listing_down_after_precheck(*args, **kwargs):
-        calls.append(1)
-        if len(calls) == 1:  # the balance pre-check still works
-            return real_list(*args, **kwargs)
-        raise NessieError("HTTP 503", status_code=503)  # the verification lookup fails
+    def list_down_after_write(account_id):
+        if attempted:
+            raise NessieError("HTTP 503", status_code=503)
+        return real_list(account_id)
 
-    monkeypatch.setattr(bank.fake, "create_withdrawal", timeout)
-    monkeypatch.setattr(bank.fake, "list_withdrawals", listing_down_after_precheck)
+    def create(*args, **kwargs):
+        attempted.append(True)
+        timeout()
+
+    monkeypatch.setattr(bank.fake, "create_withdrawal", create)
+    monkeypatch.setattr(bank.fake, "list_withdrawals", list_down_after_write)
     result = transfer(bank)
     assert result.status is S.NEEDS_ATTENTION
-    assert result.transfer_id in result.message
+    assert "last check failed" in last_detail(bank, result.transfer_id)
 
 
-# --- leg 2 failures --------------------------------------------------------------
-def test_leg2_failure_is_compensated(bank):
+def test_2xx_with_unreadable_body_is_treated_as_written(bank, monkeypatch):
+    """R1-03: a 2xx means the bank accepted it, even if we couldn't parse the reply."""
+    real_create = bank.fake.create_deposit
+
+    def accepted_then_garbled(*args, **kwargs):
+        real_create(*args, **kwargs)
+        raise NessieError("returned non-JSON body", status_code=201)
+
+    monkeypatch.setattr(bank.fake, "create_deposit", accepted_then_garbled)
+    result = transfer(bank)
+    assert result.status is S.COMPLETED  # found by the re-check, not compensated
+    assert balances(bank) == (950, 550)
+    assert_reconciles(bank)
+
+
+# --- leg 2 outcomes ----------------------------------------------------------------
+def test_leg2_rejected_is_compensated(bank):
     bank.fake.fail_next("create_deposit")
     result = transfer(bank)
     assert result.status is S.COMPENSATED
-    assert balances(bank) == (1000, 500)  # the reversal put the money back
-    assert history(bank, result.transfer_id) == [S.EXECUTING, S.LEG1_DONE, S.COMPENSATED]
+    assert balances(bank) == (1000, 500)
+    assert history(bank, result.transfer_id)[-1] is S.COMPENSATED
     assert bank.audit.get(result.transfer_id).reversal_id is not None
+    assert "leg 2 rejected" in last_detail(bank, result.transfer_id)
     assert_reconciles(bank)
 
 
@@ -116,39 +213,93 @@ def test_leg2_ambiguous_but_written_completes(bank):
     assert_reconciles(bank)
 
 
-def test_leg2_and_reversal_fail_needs_attention(bank):
+def test_leg2_late_write_found_on_a_recheck(bank):
+    bank.fake.fail_next("create_deposit", appears_after_lists=1)
+    result = transfer(bank)
+    assert result.status is S.COMPLETED
+    assert bank.fake.list_deposits(bank.checking.id) == []  # no reversal
+    assert_reconciles(bank)
+
+
+def test_leg2_unknown_is_not_compensated(bank):
+    """R1-02: compensating while leg 2 may still land could create money."""
+    bank.fake.fail_next("create_deposit", appears_after_lists=100)
+    result = transfer(bank)
+    assert result.status is S.NEEDS_ATTENTION
+    assert bank.fake.list_deposits(bank.checking.id) == []  # no reversal written
+    bank.fake.flush_late_writes()
+    assert balances(bank) == (950, 550)  # totals still add up to 1500
+
+
+# --- compensation outcomes ----------------------------------------------------------
+def test_reversal_rejected_needs_attention(bank):
     bank.fake.fail_next("create_deposit")  # leg 2
     bank.fake.fail_next("create_deposit")  # reversal
     result = transfer(bank)
     assert result.status is S.NEEDS_ATTENTION
     assert balances(bank) == (950, 500)  # money is out of checking: a human must fix it
-    report = reconcile(bank.fake, bank.audit, [bank.checking.id, bank.savings.id])
-    assert report.count("needs_attention") == 1
+    assert report(bank).count(V.NEEDS_ATTENTION) == 1
 
 
-# --- pre-checks: rejected before anything is written -------------------------------
+def test_reversal_ambiguous_but_written_is_compensated(bank):
+    bank.fake.fail_next("create_deposit")  # leg 2 rejected
+    bank.fake.fail_next("create_deposit", ambiguous=True)  # reversal written, then timeout
+    result = transfer(bank)
+    assert result.status is S.COMPENSATED
+    assert balances(bank) == (1000, 500)
+    assert_reconciles(bank)
+
+
+def test_reversal_unknown_needs_attention(bank):
+    bank.fake.fail_next("create_deposit")
+    bank.fake.fail_next("create_deposit", appears_after_lists=100)
+    result = transfer(bank)
+    assert result.status is S.NEEDS_ATTENTION
+    assert "reversal unknown" in last_detail(bank, result.transfer_id)
+
+
+# --- pre-checks: rejected before anything is recorded --------------------------------
 @pytest.mark.parametrize("amount", [0, -5, 12.5, True])
 def test_bad_amounts_are_rejected(bank, amount):
     with pytest.raises(TransferRejected):
-        transfer(bank, amount=amount)
+        propose(bank, amount)
     assert bank.audit.records() == []
 
 
 def test_insufficient_funds(bank):
     with pytest.raises(TransferRejected, match="insufficient"):
-        transfer(bank, amount=1001)
+        propose(bank, 1001)
     assert bank.audit.records() == []
 
 
 def test_same_account(bank):
     with pytest.raises(TransferRejected):
-        bank.service.execute(bank.customer_id, bank.checking.id, bank.checking.id, 10)
+        bank.service.create_pending(bank.customer_id, bank.checking.id, bank.checking.id, 10)
 
 
 def test_someone_elses_account(bank):
     with pytest.raises(TransferRejected, match="belong"):
-        bank.service.execute(bank.customer_id, bank.checking.id, bank.other_customer_account.id, 10)
-    assert bank.fake.list_deposits(bank.other_customer_account.id) == []
+        bank.service.create_pending(
+            bank.customer_id, bank.checking.id, bank.other_customer_account.id, 10
+        )
+
+
+def test_unknown_account_never_receives_a_leg(bank):
+    """D36: the bank would accept a deposit for a made-up account; the saga must not try."""
+    with pytest.raises(TransferRejected):
+        bank.service.create_pending(bank.customer_id, bank.checking.id, "no-such-account", 10)
+    assert bank.fake.list_deposits("no-such-account") == []
+    assert bank.fake.list_withdrawals(bank.checking.id) == []
+
+
+def test_destination_deleted_after_proposal_is_cancelled(bank):
+    pending = propose(bank)
+    bank.fake.delete_account(bank.savings.id)
+    with pytest.raises(TransferRejected):
+        bank.service.execute_pending(pending.transfer_id)
+    assert bank.audit.get(pending.transfer_id).status is S.CANCELLED
+    assert bank.fake.list_withdrawals(bank.checking.id) == []
+    assert bank.fake.list_deposits(bank.savings.id) == []
 
 
 def test_balance_read_failure_is_a_rejection(bank, monkeypatch):
@@ -157,42 +308,34 @@ def test_balance_read_failure_is_a_rejection(bank, monkeypatch):
 
     monkeypatch.setattr(bank.fake, "list_deposits", down)
     with pytest.raises(TransferRejected, match="balance"):
-        transfer(bank)
+        propose(bank)
     assert bank.audit.records() == []
-
-
-def test_unknown_account(bank):
-    with pytest.raises(TransferRejected):
-        bank.service.execute(bank.customer_id, bank.checking.id, "no-such-account", 10)
 
 
 def test_balance_check_uses_computed_balance(bank):
     """After moving $950 out, the stored balance still says 1000; the check must not."""
-    transfer(bank, amount=950)
+    transfer(bank, 950)
     with pytest.raises(TransferRejected, match="insufficient"):
-        transfer(bank, amount=100)
+        propose(bank, 100)
 
 
-# --- pending records (used by the M1d confirmation flow) -----------------------------
-def test_executes_a_matching_pending_record(bank):
-    bank.audit.create(
-        "LV-TRF-pending1", bank.customer_id, bank.checking.id, bank.savings.id, 50, S.PENDING
-    )
-    result = transfer(bank, transfer_id="LV-TRF-pending1")
-    assert result.status is S.COMPLETED
-    assert history(bank, "LV-TRF-pending1") == [S.PENDING, S.EXECUTING, S.LEG1_DONE, S.COMPLETED]
+# --- concurrency (R1-08) ---------------------------------------------------------------
+def test_concurrent_executions_cannot_overspend(bank):
+    first, second = propose(bank, 700), propose(bank, 700)
+    results, errors = [], []
 
+    def run(tid):
+        try:
+            results.append(bank.service.execute_pending(tid))
+        except TransferRejected as exc:
+            errors.append(exc)
 
-def test_pending_record_must_match(bank):
-    bank.audit.create(
-        "LV-TRF-pending2", bank.customer_id, bank.checking.id, bank.savings.id, 50, S.PENDING
-    )
-    with pytest.raises(TransferRejected, match="does not match"):
-        transfer(bank, amount=500, transfer_id="LV-TRF-pending2")
-
-
-def test_finished_record_cannot_run_again(bank):
-    tid = transfer(bank).transfer_id
-    with pytest.raises(TransferRejected):
-        transfer(bank, transfer_id=tid)
-    assert len(bank.fake.list_withdrawals(bank.checking.id)) == 1
+    threads = [threading.Thread(target=run, args=(t.transfer_id,)) for t in (first, second)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(results) == 1 and results[0].succeeded
+    assert len(errors) == 1
+    assert balances(bank) == (300, 1200)
+    assert_reconciles(bank)

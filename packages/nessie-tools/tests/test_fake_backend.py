@@ -68,3 +68,29 @@ def test_failures_queue_and_then_stop(fake, account_id):
 def test_fail_next_rejects_unknown_operation(fake):
     with pytest.raises(ValueError):
         fake.fail_next("create_transfer")
+
+
+def test_late_write_lands_after_n_list_calls(fake, account_id):
+    fake.fail_next("create_withdrawal", appears_after_lists=1)
+    with pytest.raises(BackendFailure) as info:
+        fake.create_withdrawal(account_id, 50, DAY, "late")
+    assert is_ambiguous(info.value)
+    assert fake.list_withdrawals(account_id) == []  # first look: not there yet
+    assert [w.description for w in fake.list_withdrawals(account_id)] == ["late"]
+
+
+def test_flush_late_writes(fake, account_id):
+    fake.fail_next("create_deposit", appears_after_lists=50)
+    with pytest.raises(BackendFailure):
+        fake.create_deposit(account_id, 5, DAY, "late")
+    fake.flush_late_writes()
+    assert len(fake.list_deposits(account_id)) == 1
+
+
+def test_fake_has_no_referential_integrity_like_nessie(fake, account_id):
+    """D36: mirrors live Nessie (verified 2026-11-20)."""
+    fake.create_deposit(account_id, 5, DAY, "kept")
+    fake.delete_account(account_id)
+    assert len(fake.list_deposits(account_id)) == 1
+    fake.create_withdrawal("never-existed", 5, DAY, "accepted")
+    assert len(fake.list_withdrawals("never-existed")) == 1

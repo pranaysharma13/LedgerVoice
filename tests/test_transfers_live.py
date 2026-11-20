@@ -41,12 +41,14 @@ def test_live_transfer_moves_money_and_reconciles(tmp_path):
         checking = bank.create_account(customer.id, AccountType.CHECKING, "Saga Checking", 300)
         savings = bank.create_account(customer.id, AccountType.SAVINGS, "Saga Savings", 100)
         try:
-            result = TransferService(bank, audit).execute(customer.id, checking.id, savings.id, 25)
+            service = TransferService(bank, audit)
+            pending = service.create_pending(customer.id, checking.id, savings.id, 25)
+            result = service.execute_pending(pending.transfer_id)
             assert result.status is TransferStatus.COMPLETED, result.message
             assert compute_balance(bank, checking.id).current == 275
             assert compute_balance(bank, savings.id).current == 125
 
-            report = reconcile(bank, audit, [checking.id, savings.id])
+            report = reconcile(bank, audit, [checking.id, savings.id], customer_ids=[customer.id])
             assert report.ok, report.violations
             assert report.legs_found == 2
         finally:

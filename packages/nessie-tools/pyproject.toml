@@ -1,7 +1,7 @@
 [project]
 name = "nessie-tools"
 version = "0.0.1"
-description = "Typed client (and, from M1, an in-memory fake) for the Capital One Nessie sandbox API"
+description = "Typed Nessie client, live + in-memory backends, computed balances, audited transfer saga and reconciliation"
 requires-python = ">=3.12"
 dependencies = [
     "httpx",
