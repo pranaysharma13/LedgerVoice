@@ -52,7 +52,13 @@ from typing import Literal
 from nessie_tools.audit import AuditLog, TransferRecord, TransferStatus
 from nessie_tools.backend import BankBackend
 from nessie_tools.balances import compute_balance
-from nessie_tools.errors import BankError, LedgerError, NessieError, NotFoundError, is_ambiguous
+from nessie_tools.errors import (
+    BankError,
+    LedgerError,
+    NotFoundError,
+    is_ambiguous,
+    is_temporary,
+)
 from nessie_tools.models import Account, Deposit, Withdrawal
 from nessie_tools.money import require_whole_dollars
 
@@ -401,7 +407,7 @@ class TransferService:
             raise TransferRejected(f"account not found: {exc}") from None
         except BankError as exc:
             raise TransferRejected(
-                f"account lookup failed: {exc}", retryable=_is_temporary(exc)
+                f"account lookup failed: {exc}", retryable=is_temporary(exc)
             ) from None
         if src.customer_id != customer_id or dst.customer_id != customer_id:
             raise TransferRejected("both accounts must belong to the customer")
@@ -412,18 +418,10 @@ class TransferService:
             available = compute_balance(self._bank, src.id, account=src).current
         except BankError as exc:
             raise TransferRejected(
-                f"could not read the balance: {exc}", retryable=_is_temporary(exc)
+                f"could not read the balance: {exc}", retryable=is_temporary(exc)
             ) from None
         if amount > available:
             raise TransferRejected(f"insufficient funds: ${available} available")
-
-
-def _is_temporary(exc: BankError) -> bool:
-    """Worth trying again later: network trouble, 5xx, or rate limiting (429).
-
-    A 400/401/403 will fail the same way every time, so it is permanent.
-    """
-    return is_ambiguous(exc) or (isinstance(exc, NessieError) and exc.status_code == 429)
 
 
 def _clip(text: str) -> str:

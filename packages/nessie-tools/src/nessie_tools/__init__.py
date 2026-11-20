@@ -26,9 +26,11 @@ from nessie_tools.errors import (
     BackendFailure,
     BankError,
     LedgerError,
+    NessieDataError,
     NessieError,
     NotFoundError,
     is_ambiguous,
+    is_temporary,
 )
 from nessie_tools.fake_backend import FakeBackend
 from nessie_tools.models import (
@@ -73,6 +75,7 @@ __all__ = [
     "Merchant",
     "NessieBackend",
     "NessieClient",
+    "NessieDataError",
     "NessieError",
     "NotFoundError",
     "Purchase",
@@ -89,6 +92,7 @@ __all__ = [
     "Withdrawal",
     "compute_balance",
     "is_ambiguous",
+    "is_temporary",
     "new_transfer_id",
     "reconcile",
     "redact_key",

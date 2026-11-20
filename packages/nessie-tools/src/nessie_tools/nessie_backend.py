@@ -23,7 +23,7 @@ from typing import Any, TypeVar
 from pydantic import BaseModel, ValidationError
 
 from nessie_tools.client import NessieClient
-from nessie_tools.errors import BankError, NessieError, NotFoundError
+from nessie_tools.errors import BankError, NessieDataError, NessieError, NotFoundError
 from nessie_tools.models import (
     Account,
     AccountType,
@@ -52,7 +52,7 @@ class NessieBackend:
     # --- helpers ---------------------------------------------------------------
     @staticmethod
     def _parse(model: type[M], data: Any, where: str) -> M:
-        """Validate one object; bad data becomes a NessieError, never a pydantic error.
+        """Validate one object; bad data becomes a NessieDataError, never a pydantic error.
 
         status_code=None marks it ambiguous: for a create, the server accepted the
         write before we failed to read the response (R1-04).
@@ -62,7 +62,7 @@ class NessieBackend:
         except ValidationError as exc:
             errors = exc.errors()
             reason = errors[0].get("msg", "invalid") if errors else "invalid"
-            raise NessieError(f"{where}: unexpected {model.__name__} data ({reason})") from None
+            raise NessieDataError(f"{where}: unexpected {model.__name__} data ({reason})") from None
 
     def _get(self, path: str) -> Any:
         try:
@@ -82,12 +82,12 @@ class NessieBackend:
                 raise NotFoundError(f"GET {path}: not found") from None
             raise
         if not isinstance(data, list):
-            raise NessieError(f"GET {path}: expected a list, got {type(data).__name__}")
+            raise NessieDataError(f"GET {path}: expected a list, got {type(data).__name__}")
         items: list[M] = []
         for item in data:
             try:
                 items.append(self._parse(model, item, f"GET {path}"))
-            except NessieError:
+            except NessieDataError:
                 if not skip_invalid:
                     raise
         return items
@@ -114,7 +114,7 @@ class NessieBackend:
         if not isinstance(obj, dict):
             obj = resp if isinstance(resp, dict) else None
         if not obj or not (obj.get("_id") or obj.get("id")):
-            raise NessieError(f"POST {path}: response has no created object id")
+            raise NessieDataError(f"POST {path}: response has no created object id")
         # The create response may omit fields; what we sent fills the gaps,
         # and anything the server returned wins.
         return self._parse(model, {**(known or {}), **payload, **obj}, f"POST {path}")

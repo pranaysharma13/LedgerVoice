@@ -5,6 +5,7 @@ import threading
 import pytest
 from conftest import TODAY
 from nessie_tools import (
+    NessieDataError,
     NessieError,
     TransferRejected,
     TransferService,
@@ -562,3 +563,34 @@ def test_balance_read_failure_uses_the_same_rule(bank, monkeypatch):
         bank.service.execute_pending(pending.transfer_id, customer_id=bank.customer_id)
     assert not info.value.retryable
     assert bank.audit.get(pending.transfer_id).status is S.CANCELLED
+
+
+def test_malformed_bank_data_cancels_instead_of_retrying_forever(bank, monkeypatch):
+    """V2 finding 5 (D41): bad data has no HTTP status but is not temporary."""
+    pending = propose(bank)
+
+    def malformed(account_id):
+        raise NessieDataError("GET /accounts/x/purchases: unexpected Purchase data (bad amount)")
+
+    monkeypatch.setattr(bank.fake, "list_purchases", malformed)
+    with pytest.raises(TransferRejected) as info:
+        bank.service.execute_pending(pending.transfer_id, customer_id=bank.customer_id)
+    assert not info.value.retryable
+    assert bank.audit.get(pending.transfer_id).status is S.CANCELLED
+    assert "unexpected Purchase data" in last_detail(bank, pending.transfer_id)
+
+
+def test_unreadable_create_response_is_still_treated_as_possibly_written(bank, monkeypatch):
+    """D41 must not weaken D33: a garbled create response means "go and look", not "failed"."""
+    real = bank.fake.create_withdrawal
+
+    def written_but_garbled(*args, **kwargs):
+        real(*args, **kwargs)
+        raise NessieDataError("POST /accounts/x/withdrawals: response has no created object id")
+
+    monkeypatch.setattr(bank.fake, "create_withdrawal", written_but_garbled)
+    result = transfer(bank)
+    assert result.status is S.COMPLETED  # the re-check found leg 1; no duplicate written
+    assert len(bank.fake.list_withdrawals(bank.checking.id)) == 1
+    assert balances(bank) == (950, 550)
+    assert_reconciles(bank)

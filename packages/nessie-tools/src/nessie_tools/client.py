@@ -13,7 +13,7 @@ from typing import Any
 
 import httpx
 
-from nessie_tools.errors import NessieError
+from nessie_tools.errors import NessieDataError, NessieError
 
 DEFAULT_BASE_URL = "https://api.nessieisreal.com"
 
@@ -100,7 +100,7 @@ class NessieClient:
             return resp.json()
         except ValueError:
             snippet = redact_key(resp.text, self._api_key)[:200]
-            raise NessieError(
+            raise NessieDataError(
                 f"{method} {path} returned non-JSON body: {snippet!r}",
                 status_code=resp.status_code,
             ) from None
@@ -109,5 +109,5 @@ class NessieClient:
     def get_customers(self) -> list[dict[str, Any]]:
         data = self.request("GET", "/customers")
         if not isinstance(data, list):
-            raise NessieError(f"expected a list of customers, got {type(data).__name__}")
+            raise NessieDataError(f"expected a list of customers, got {type(data).__name__}")
         return data

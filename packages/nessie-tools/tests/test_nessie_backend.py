@@ -6,13 +6,17 @@ from datetime import date
 import httpx
 import pytest
 from nessie_tools import (
+    Account,
     AccountType,
     AmountError,
     NessieBackend,
     NessieClient,
+    NessieDataError,
     NessieError,
     NotFoundError,
+    compute_balance,
     is_ambiguous,
+    is_temporary,
 )
 
 KEY = "fake-test-key-123"  # gitleaks:allow (fake key, used only in offline tests)
@@ -108,7 +112,7 @@ def test_non_list_response_is_an_error():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"oops": True})
 
-    with pytest.raises(NessieError):
+    with pytest.raises(NessieDataError):
         backend_with(handler).list_purchases("acc")
 
 
@@ -155,9 +159,10 @@ def test_unreadable_create_response_is_ambiguous_nessie_error():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(201, json={"objectCreated": {"_id": "d-1", "amount": "lots"}})
 
-    with pytest.raises(NessieError) as info:
+    with pytest.raises(NessieDataError) as info:
         backend_with(handler).create_deposit("acc", 5, date(2026, 11, 1), "x")
-    assert is_ambiguous(info.value)
+    assert is_ambiguous(info.value)  # the write was probably accepted: check, don't redo
+    assert not is_temporary(info.value)  # D41: retrying gives the same bad data
 
 
 def test_bad_shared_merchants_are_skipped():
@@ -173,7 +178,7 @@ def test_bad_item_on_our_account_raises():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=[{"_id": "p-1", "amount": "lots"}])
 
-    with pytest.raises(NessieError):
+    with pytest.raises(NessieDataError):
         backend_with(handler).list_purchases("acc")
 
 
@@ -188,3 +193,50 @@ def test_account_kept_when_read_back_fails():
     account = backend_with(handler).create_account("cust-1", AccountType.CHECKING, "Main", 0)
     assert account.id == "acc-9"
     assert account.account_number == ""
+
+
+def test_create_without_an_id_is_ambiguous_but_not_temporary():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(201, json={"message": "Created"})
+
+    with pytest.raises(NessieDataError) as info:
+        backend_with(handler).create_withdrawal("acc", 5, date(2026, 11, 1), "x")
+    assert is_ambiguous(info.value)
+    assert not is_temporary(info.value)
+
+
+def test_non_json_body_is_a_data_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html>gateway hiccup</html>")
+
+    with pytest.raises(NessieDataError) as info:
+        backend_with(handler).list_deposits("acc")
+    assert not is_temporary(info.value)
+
+
+def test_connection_failure_is_temporary_not_a_data_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    with pytest.raises(NessieError) as info:
+        backend_with(handler).list_deposits("acc")
+    assert not isinstance(info.value, NessieDataError)
+    assert is_temporary(info.value)
+
+
+def test_malformed_purchase_makes_the_balance_unreadable_permanently():
+    """V2 finding 5: the exact repro. Retrying would read the same bad record forever."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/purchases"):
+            return httpx.Response(200, json=[{"_id": "p-1", "amount": "lots"}])
+        return httpx.Response(200, json=[])
+
+    backend = backend_with(handler)
+    account = Account.model_validate(
+        {"_id": "acc", "type": "Checking", "nickname": "c", "balance": 100, "customer_id": "cu"}
+    )
+    with pytest.raises(NessieDataError) as info:
+        compute_balance(backend, "acc", account=account)
+    assert info.value.status_code is None  # looks like a network error by status alone...
+    assert not is_temporary(info.value)  # ...but is classified as permanent

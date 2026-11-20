@@ -29,6 +29,15 @@ class NessieError(BankError):
         self.body = body
 
 
+class NessieDataError(NessieError):
+    """The server answered, but the data was not what we expect (wrong shape, missing
+    id, invalid record, not JSON).
+
+    Retrying returns the same data, so it is never temporary (D41). It may still be
+    ambiguous: a create whose response we can't read was probably written.
+    """
+
+
 class NotFoundError(BankError):
     """The requested customer, account or merchant does not exist."""
 
@@ -65,4 +74,24 @@ def is_ambiguous(exc: BaseException) -> bool:
     if isinstance(exc, NessieError):
         code = exc.status_code
         return code is None or code >= 500 or 200 <= code < 300
+    return False
+
+
+def is_temporary(exc: BaseException) -> bool:
+    """True if trying the same request again later could succeed (D41).
+
+    A different question from is_ambiguous ("might a write have happened?"):
+    - Temporary: a transport failure (no HTTP status), a 5xx, or 429 rate limiting.
+    - Never temporary: bad data from the server (NessieDataError), a 2xx, or any
+      other 4xx (400/401/403 fail the same way every time).
+    - Injected failures (FakeBackend) count as temporary when marked ambiguous,
+      like a timeout.
+    """
+    if isinstance(exc, BackendFailure):
+        return exc.ambiguous
+    if isinstance(exc, NessieDataError):
+        return False
+    if isinstance(exc, NessieError):
+        code = exc.status_code
+        return code is None or code >= 500 or code == 429
     return False
