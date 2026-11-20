@@ -1,6 +1,6 @@
 PY := .venv/bin/python
 
-.PHONY: venv setup upgrade freeze test lint fmt smoke probe-nessie costs
+.PHONY: venv setup upgrade freeze test test-live lint fmt smoke probe-nessie costs
 
 venv:
 	python3.12 -m venv .venv
@@ -21,9 +21,13 @@ freeze:
 test:
 	$(PY) -m pytest -q
 
+test-live:
+	$(PY) -m pytest -q -m live
+
 lint:
 	$(PY) -m ruff check .
 	$(PY) -m ruff format --check .
+	$(PY) -m mypy
 
 fmt:
 	$(PY) -m ruff format .

@@ -18,6 +18,7 @@ dev = [
     "pytest",
     "ruff",
     "pre-commit",
+    "mypy",
 ]
 
 [build-system]
@@ -39,3 +40,11 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "packages/nessie-tools/tests"]
+markers = ["live: calls the real Nessie API (run with `make test-live`)"]
+addopts = "-m 'not live'"
+
+[tool.mypy]
+python_version = "3.12"
+plugins = ["pydantic.mypy"]
+files = ["packages/nessie-tools/src"]
+strict = true

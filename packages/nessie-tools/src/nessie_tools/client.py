@@ -2,8 +2,8 @@
 
 Why a hand-written client instead of an SDK: Nessie's official SDKs are old and
 untyped. We only need a handful of endpoints, and owning the client lets us add
-the things that matter for this project: key redaction, timeouts, and (in M1) a
-fake backend with the same interface.
+the things that matter for this project: key redaction, timeouts, HTTPS enforcement.
+The typed operations live in nessie_backend.py; this file only moves JSON.
 """
 
 from __future__ import annotations
@@ -13,6 +13,8 @@ from typing import Any
 
 import httpx
 
+from nessie_tools.errors import NessieError
+
 DEFAULT_BASE_URL = "https://api.nessieisreal.com"
 
 _KEY_PARAM = re.compile(r"([?&]key=)[^&\s'\"]+")
@@ -21,20 +23,11 @@ _KEY_PARAM = re.compile(r"([?&]key=)[^&\s'\"]+")
 def redact_key(text: str, api_key: str | None = None) -> str:
     """Remove the API key from a URL or message.
 
-    Two passes: the literal key (wherever it appears) and any `key=...` query param.
+    Two passes: the literal key (wherever it appears) and any `?key=` / `&key=` param.
     """
     if api_key:
         text = text.replace(api_key, "***")
     return _KEY_PARAM.sub(r"\1***", text)
-
-
-class NessieError(RuntimeError):
-    """Raised for HTTP or transport errors. The message never contains the API key."""
-
-    def __init__(self, message: str, status_code: int | None = None, body: str | None = None):
-        super().__init__(message)
-        self.status_code = status_code
-        self.body = body
 
 
 class NessieClient:
@@ -45,18 +38,27 @@ class NessieClient:
         timeout: float = 10.0,
         http: httpx.Client | None = None,
     ) -> None:
+        """Create a client.
+
+        If `http` is given (tests inject one with a mock transport), that client is
+        used as-is: its own base_url and timeout apply, and this class will NOT close
+        it, because the caller owns it (F-23). Otherwise a client is created here and
+        closed by close().
+        """
         if not api_key:
             raise ValueError("Nessie API key is required")
         if not base_url.startswith("https://"):
             raise ValueError("Nessie base URL must use https:// (the API key is sent in the URL)")
         self._api_key = api_key
+        self._owns_http = http is None
         self._http = http or httpx.Client(
             base_url=base_url.rstrip("/"), timeout=timeout, follow_redirects=False
         )
 
     # --- lifecycle -------------------------------------------------------------
     def close(self) -> None:
-        self._http.close()
+        if self._owns_http:
+            self._http.close()
 
     def __enter__(self) -> NessieClient:
         return self
@@ -73,7 +75,10 @@ class NessieClient:
         json: Any = None,
         params: dict[str, Any] | None = None,
     ) -> Any:
-        """Send a request and return parsed JSON (or None for an empty body)."""
+        """Send a request and return parsed JSON (or None for an empty body).
+
+        Raises NessieError for transport errors and for any non-2xx status.
+        """
         query = {"key": self._api_key, **(params or {})}
         try:
             resp = self._http.request(method, path, params=query, json=json)
@@ -94,13 +99,13 @@ class NessieClient:
         try:
             return resp.json()
         except ValueError:
+            snippet = redact_key(resp.text, self._api_key)[:200]
             raise NessieError(
-                f"{method} {path} returned non-JSON body: "
-                f"{redact_key(resp.text, self._api_key)[:200]!r}",
+                f"{method} {path} returned non-JSON body: {snippet!r}",
                 status_code=resp.status_code,
             ) from None
 
-    # --- endpoints used in M0 --------------------------------------------------
+    # --- used by the M0 smoke check --------------------------------------------
     def get_customers(self) -> list[dict[str, Any]]:
         data = self.request("GET", "/customers")
         if not isinstance(data, list):

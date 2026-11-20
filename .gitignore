@@ -17,6 +17,7 @@ build/
 .ledger/
 .artifacts/
 *.wav
+.data/
 
 # OS / editors
 .DS_Store
