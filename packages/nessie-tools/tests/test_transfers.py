@@ -441,3 +441,124 @@ def test_destination_deleted_after_leg1_is_compensated(bank, monkeypatch):
     assert bank.fake.list_deposits(bank.savings.id) == []  # nothing sent into the void
     assert compute_balance(bank.fake, bank.checking.id).current == 1000
     assert "no longer exists" in last_detail(bank, result.transfer_id)
+
+
+def fail_get_account(bank, monkeypatch, account_id, *, on_call, error):
+    """Make the `on_call`-th get_account(account_id) during execution raise `error`.
+
+    Call 1 is the execution pre-check; call 2 is the mid-transfer check.
+    """
+    real = bank.fake.get_account
+    calls = {"n": 0}
+
+    def flaky(requested_id):
+        if requested_id == account_id:
+            calls["n"] += 1
+            if calls["n"] == on_call:
+                raise error
+        return real(requested_id)
+
+    monkeypatch.setattr(bank.fake, "get_account", flaky)
+
+
+def test_unverifiable_destination_before_leg2_is_compensated(bank, monkeypatch):
+    """N2 (D40): "couldn't check" must not count as "exists".
+
+    Nothing has been written to the destination yet, so returning the money is safe."""
+    pending = propose(bank)
+    fail_get_account(
+        bank,
+        monkeypatch,
+        bank.savings.id,
+        on_call=2,
+        error=NessieError("HTTP 503", status_code=503),
+    )
+    result = bank.service.execute_pending(pending.transfer_id, customer_id=bank.customer_id)
+    assert result.status is S.COMPENSATED
+    assert bank.fake.list_deposits(bank.savings.id) == []  # leg 2 never sent
+    assert balances(bank) == (1000, 500)
+    assert "could not verify the destination" in last_detail(bank, result.transfer_id)
+    assert_reconciles(bank)
+
+
+def leg2_rejected_and_then(bank, monkeypatch, side_effect):
+    """Leg 2 is cleanly rejected (4xx-like); `side_effect` runs at that moment."""
+    real = bank.fake.create_deposit
+    calls = {"n": 0}
+
+    def deposit(account_id, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:  # leg 2
+            side_effect()
+            raise NessieError("HTTP 400 rejected", status_code=400)
+        return real(account_id, *args, **kwargs)
+
+    monkeypatch.setattr(bank.fake, "create_deposit", deposit)
+
+
+def test_reversal_is_not_sent_to_a_deleted_source(bank, monkeypatch):
+    """N1 (D40): never tell the user "returned" when it would land in a deleted account."""
+    leg2_rejected_and_then(bank, monkeypatch, lambda: bank.fake.delete_account(bank.checking.id))
+    result = transfer(bank)
+    assert result.status is S.NEEDS_ATTENTION
+    assert "returned" not in result.message
+    assert bank.fake.list_deposits(bank.checking.id) == []  # no reversal written
+    detail = last_detail(bank, result.transfer_id)
+    assert "source account no longer exists" in detail
+    assert "reversal not written" in detail
+
+
+def test_reversal_waits_when_the_source_cannot_be_verified(bank, monkeypatch):
+    pending = propose(bank)
+    leg2_rejected_and_then(bank, monkeypatch, lambda: None)
+    fail_get_account(
+        bank,
+        monkeypatch,
+        bank.checking.id,
+        on_call=2,
+        error=NessieError("timeout", status_code=None),
+    )
+    result = bank.service.execute_pending(pending.transfer_id, customer_id=bank.customer_id)
+    assert result.status is S.NEEDS_ATTENTION
+    assert bank.fake.list_deposits(bank.checking.id) == []
+    assert "could not verify the source account" in last_detail(bank, result.transfer_id)
+
+
+@pytest.mark.parametrize(
+    ("status_code", "retryable", "final"),
+    [
+        (None, True, S.PENDING),  # network failure
+        (503, True, S.PENDING),
+        (429, True, S.PENDING),  # rate limited: try later
+        (401, False, S.CANCELLED),  # bad key: will never work
+        (403, False, S.CANCELLED),
+        (400, False, S.CANCELLED),
+    ],
+)
+def test_only_temporary_failures_are_retryable(bank, monkeypatch, status_code, retryable, final):
+    """N3: a retry loop on a 401 would never end."""
+    pending = propose(bank)
+    fail_get_account(
+        bank,
+        monkeypatch,
+        bank.checking.id,
+        on_call=1,
+        error=NessieError(f"HTTP {status_code}", status_code=status_code),
+    )
+    with pytest.raises(TransferRejected) as info:
+        bank.service.execute_pending(pending.transfer_id, customer_id=bank.customer_id)
+    assert info.value.retryable is retryable
+    assert bank.audit.get(pending.transfer_id).status is final
+
+
+def test_balance_read_failure_uses_the_same_rule(bank, monkeypatch):
+    pending = propose(bank)
+
+    def unauthorized(account_id):
+        raise NessieError("HTTP 401", status_code=401)
+
+    monkeypatch.setattr(bank.fake, "list_deposits", unauthorized)
+    with pytest.raises(TransferRejected) as info:
+        bank.service.execute_pending(pending.transfer_id, customer_id=bank.customer_id)
+    assert not info.value.retryable
+    assert bank.audit.get(pending.transfer_id).status is S.CANCELLED

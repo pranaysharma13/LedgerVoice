@@ -92,7 +92,10 @@ class ReconcileReport:
         return not self.violations
 
     def count(self, kind: ViolationKind | str) -> int:
-        return sum(1 for v in self.violations if v.kind == kind)
+        """Number of violations of `kind`. An unknown kind (a typo) raises ValueError
+        instead of silently counting zero."""
+        wanted = ViolationKind(kind)
+        return sum(1 for v in self.violations if v.kind is wanted)
 
 
 def _leg_kind(description: str, is_withdrawal: bool) -> LegKind:

@@ -52,7 +52,7 @@ from typing import Literal
 from nessie_tools.audit import AuditLog, TransferRecord, TransferStatus
 from nessie_tools.backend import BankBackend
 from nessie_tools.balances import compute_balance
-from nessie_tools.errors import BankError, LedgerError, NotFoundError, is_ambiguous
+from nessie_tools.errors import BankError, LedgerError, NessieError, NotFoundError, is_ambiguous
 from nessie_tools.models import Account, Deposit, Withdrawal
 from nessie_tools.money import require_whole_dollars
 
@@ -123,6 +123,9 @@ class TransferResult:
     @property
     def succeeded(self) -> bool:
         return self.status is TransferStatus.COMPLETED
+
+
+AccountState = Literal["exists", "gone", "unknown"]
 
 
 @dataclass(frozen=True)
@@ -227,10 +230,17 @@ class TransferService:
         )
 
         # leg 2: deposit. The bank accepts deposits to deleted accounts (D36), so make
-        # sure the destination still exists right before writing (V1-03).
+        # sure the destination still exists right before writing (V1-03). If we can't
+        # tell, don't write: leg 2 is then definitely not written and leg 1 is
+        # returned below (D40).
         desc2 = leg2_description(tid, src.last4)
-        if self._account_gone(dst.id):
+        dst_state, dst_reason = self._account_state(dst.id)
+        if dst_state == "gone":
             leg2 = _Outcome("not_written", reason="destination account no longer exists")
+        elif dst_state == "unknown":
+            leg2 = _Outcome(
+                "not_written", reason=f"could not verify the destination account: {dst_reason}"
+            )
         else:
             leg2 = self._write_leg(
                 lambda: self._bank.create_deposit(dst.id, amount, when, desc2),
@@ -248,7 +258,23 @@ class TransferService:
                 tid, S.NEEDS_ATTENTION, f"leg 2 outcome unknown: {leg2.reason}", src, dst
             )
 
-        # compensation: leg 2 was definitely not written, so put the money back
+        # compensation: leg 2 was definitely not written, so put the money back - but
+        # only into a source account we know still exists (D40). Otherwise a human
+        # has to decide where the money goes.
+        src_state, src_reason = self._account_state(src.id)
+        if src_state != "exists":
+            why = (
+                "source account no longer exists"
+                if src_state == "gone"
+                else f"could not verify the source account: {src_reason}"
+            )
+            return self._finish(
+                tid,
+                S.NEEDS_ATTENTION,
+                f"leg 2 rejected: {leg2.reason}; {why}; reversal not written",
+                src,
+                dst,
+            )
         desc_r = reversal_description(tid)
         reversal = self._write_leg(
             lambda: self._bank.create_deposit(src.id, amount, when, desc_r),
@@ -349,15 +375,19 @@ class TransferService:
             raise TransferRejected(f"{transfer_id} is {record.status}, not PENDING")
         return record
 
-    def _account_gone(self, account_id: str) -> bool:
-        """True only if the bank says the account doesn't exist (a failed check is not proof)."""
+    def _account_state(self, account_id: str) -> tuple[AccountState, str]:
+        """Does the account exist right now? "unknown" if the check itself failed.
+
+        Callers must decide explicitly what "unknown" means, so a failed check can never
+        be mistaken for "exists" (D40).
+        """
         try:
             self._bank.get_account(account_id)
         except NotFoundError:
-            return True
-        except BankError:
-            return False
-        return False
+            return "gone", ""
+        except BankError as exc:
+            return "unknown", _clip(str(exc))
+        return "exists", ""
 
     def _check_accounts(
         self, customer_id: str, from_account_id: str, to_account_id: str
@@ -370,7 +400,9 @@ class TransferService:
         except NotFoundError as exc:
             raise TransferRejected(f"account not found: {exc}") from None
         except BankError as exc:
-            raise TransferRejected(f"account lookup failed: {exc}", retryable=True) from None
+            raise TransferRejected(
+                f"account lookup failed: {exc}", retryable=_is_temporary(exc)
+            ) from None
         if src.customer_id != customer_id or dst.customer_id != customer_id:
             raise TransferRejected("both accounts must belong to the customer")
         return src, dst
@@ -379,9 +411,19 @@ class TransferService:
         try:
             available = compute_balance(self._bank, src.id, account=src).current
         except BankError as exc:
-            raise TransferRejected(f"could not read the balance: {exc}", retryable=True) from None
+            raise TransferRejected(
+                f"could not read the balance: {exc}", retryable=_is_temporary(exc)
+            ) from None
         if amount > available:
             raise TransferRejected(f"insufficient funds: ${available} available")
+
+
+def _is_temporary(exc: BankError) -> bool:
+    """Worth trying again later: network trouble, 5xx, or rate limiting (429).
+
+    A 400/401/403 will fail the same way every time, so it is permanent.
+    """
+    return is_ambiguous(exc) or (isinstance(exc, NessieError) and exc.status_code == 429)
 
 
 def _clip(text: str) -> str:

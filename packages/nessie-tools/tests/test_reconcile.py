@@ -2,6 +2,7 @@
 
 from datetime import date
 
+import pytest
 from nessie_tools import TransferStatus, TxStatus, ViolationKind, reconcile
 
 S = TransferStatus
@@ -218,8 +219,10 @@ def test_missing_account_names_the_transfers_touching_it(bank):
 
 
 def test_count_accepts_plain_strings(bank):
-    """V1-09: a typo-free string works too; a typo can't silently match anything."""
+    """V1-09: plain strings work; a typo raises instead of silently counting zero."""
     bank.fake.create_withdrawal(bank.checking.id, 75, DAY, "LV-TRF-deadbeef sneaky (leg 1/2)")
     report = run(bank)
     assert report.count("unaudited_leg") == 1
-    assert report.count("unaudited_legs") == 0
+    assert report.count(V.UNAUDITED_LEG) == 1
+    with pytest.raises(ValueError):
+        report.count("unaudited_legs")
