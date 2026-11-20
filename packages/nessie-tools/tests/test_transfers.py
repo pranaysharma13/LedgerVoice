@@ -3,9 +3,11 @@
 import threading
 
 import pytest
+from conftest import TODAY
 from nessie_tools import (
     NessieError,
     TransferRejected,
+    TransferService,
     TransferStatus,
     ViolationKind,
     compute_balance,
@@ -29,7 +31,8 @@ def propose(bank, amount=50):
 
 def transfer(bank, amount=50):
     """Propose + execute: the only way money can move."""
-    return bank.service.execute_pending(propose(bank, amount).transfer_id)
+    pending = propose(bank, amount)
+    return bank.service.execute_pending(pending.transfer_id, customer_id=bank.customer_id)
 
 
 def history(bank, tid):
@@ -76,7 +79,7 @@ def test_legs_carry_the_transfer_id(bank):
 @pytest.mark.parametrize("bad_id", ["LV-TRF-0badc0de", "LV-TRF-hallucinated", "confirm 42", ""])
 def test_unknown_or_invented_id_moves_nothing(bank, bad_id):
     with pytest.raises(TransferRejected):
-        bank.service.execute_pending(bad_id)
+        bank.service.execute_pending(bad_id, customer_id=bank.customer_id)
     assert bank.audit.records() == []
     assert balances(bank) == (1000, 500)
 
@@ -84,19 +87,19 @@ def test_unknown_or_invented_id_moves_nothing(bank, bad_id):
 def test_finished_transfer_cannot_run_again(bank):
     tid = transfer(bank).transfer_id
     with pytest.raises(TransferRejected):
-        bank.service.execute_pending(tid)
+        bank.service.execute_pending(tid, customer_id=bank.customer_id)
     assert len(bank.fake.list_withdrawals(bank.checking.id)) == 1
 
 
 def test_cancelled_and_expired_transfers_cannot_run(bank):
     a, b = propose(bank), propose(bank, 20)
-    bank.service.cancel_pending(a.transfer_id, reason="user said no")
-    bank.service.cancel_pending(b.transfer_id, expired=True)
+    bank.service.cancel_pending(a.transfer_id, customer_id=bank.customer_id, reason="user said no")
+    bank.service.cancel_pending(b.transfer_id, customer_id=bank.customer_id, expired=True)
     assert bank.audit.get(a.transfer_id).status is S.CANCELLED
     assert bank.audit.get(b.transfer_id).status is S.EXPIRED
     for tid in (a.transfer_id, b.transfer_id):
         with pytest.raises(TransferRejected):
-            bank.service.execute_pending(tid)
+            bank.service.execute_pending(tid, customer_id=bank.customer_id)
     assert balances(bank) == (1000, 500)
     assert_reconciles(bank)
 
@@ -104,15 +107,15 @@ def test_cancelled_and_expired_transfers_cannot_run(bank):
 def test_cancel_requires_pending(bank):
     tid = transfer(bank).transfer_id
     with pytest.raises(TransferRejected):
-        bank.service.cancel_pending(tid)
+        bank.service.cancel_pending(tid, customer_id=bank.customer_id)
 
 
 def test_funds_rechecked_at_execution(bank):
     """Proposed while affordable; by the time the user says yes, it no longer is."""
     first, second = propose(bank, 600), propose(bank, 600)
-    assert bank.service.execute_pending(first.transfer_id).succeeded
+    assert bank.service.execute_pending(first.transfer_id, customer_id=bank.customer_id).succeeded
     with pytest.raises(TransferRejected, match="insufficient"):
-        bank.service.execute_pending(second.transfer_id)
+        bank.service.execute_pending(second.transfer_id, customer_id=bank.customer_id)
     assert bank.audit.get(second.transfer_id).status is S.CANCELLED
     assert balances(bank) == (400, 1100)
 
@@ -296,7 +299,7 @@ def test_destination_deleted_after_proposal_is_cancelled(bank):
     pending = propose(bank)
     bank.fake.delete_account(bank.savings.id)
     with pytest.raises(TransferRejected):
-        bank.service.execute_pending(pending.transfer_id)
+        bank.service.execute_pending(pending.transfer_id, customer_id=bank.customer_id)
     assert bank.audit.get(pending.transfer_id).status is S.CANCELLED
     assert bank.fake.list_withdrawals(bank.checking.id) == []
     assert bank.fake.list_deposits(bank.savings.id) == []
@@ -326,7 +329,7 @@ def test_concurrent_executions_cannot_overspend(bank):
 
     def run(tid):
         try:
-            results.append(bank.service.execute_pending(tid))
+            results.append(bank.service.execute_pending(tid, customer_id=bank.customer_id))
         except TransferRejected as exc:
             errors.append(exc)
 
@@ -339,3 +342,102 @@ def test_concurrent_executions_cannot_overspend(bank):
     assert len(errors) == 1
     assert balances(bank) == (300, 1200)
     assert_reconciles(bank)
+
+
+def test_two_service_instances_cannot_overspend(bank, monkeypatch):
+    """V1-01: the account lock is shared by every TransferService in the process."""
+    other = TransferService(bank.fake, bank.audit, today=lambda: TODAY, sleep=lambda _: None)
+    first, second = propose(bank, 700), propose(bank, 700)
+    outcomes = []
+    # Make the race deterministic: without a shared lock both threads meet here and
+    # both read the 1000 balance before either writes. With the lock, the first
+    # thread waits out the timeout alone and the second never gets this far early.
+    meet = threading.Barrier(2, timeout=1.0)
+    real_list = bank.fake.list_withdrawals
+
+    def list_after_meeting(account_id):
+        try:
+            meet.wait()
+        except threading.BrokenBarrierError:
+            pass
+        return real_list(account_id)
+
+    monkeypatch.setattr(bank.fake, "list_withdrawals", list_after_meeting)
+
+    def run(service, tid):
+        try:
+            outcomes.append(service.execute_pending(tid, customer_id=bank.customer_id))
+        except TransferRejected as exc:
+            outcomes.append(exc)
+
+    threads = [
+        threading.Thread(target=run, args=(bank.service, first.transfer_id)),
+        threading.Thread(target=run, args=(other, second.transfer_id)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sum(1 for o in outcomes if isinstance(o, TransferRejected)) == 1
+    assert balances(bank) == (300, 1200)
+    assert_reconciles(bank)
+
+
+def test_other_customers_cannot_execute_or_cancel(bank):
+    """V1-06: a session can only act on its own customer's pending transfers."""
+    pending = propose(bank)
+    stranger = bank.other_customer_account.customer_id
+    with pytest.raises(TransferRejected, match="no transfer"):
+        bank.service.execute_pending(pending.transfer_id, customer_id=stranger)
+    with pytest.raises(TransferRejected, match="no transfer"):
+        bank.service.cancel_pending(pending.transfer_id, customer_id=stranger)
+    assert bank.audit.get(pending.transfer_id).status is S.PENDING  # untouched
+    assert balances(bank) == (1000, 500)
+
+
+def test_temporary_check_failure_keeps_the_transfer_pending(bank, monkeypatch):
+    """V1-04: a blip right after the user's yes must not throw the transfer away."""
+    pending = propose(bank)
+    real = bank.fake.list_deposits
+    calls = []
+
+    def flaky(account_id):
+        calls.append(1)
+        if len(calls) == 1:
+            raise NessieError("HTTP 503", status_code=503)
+        return real(account_id)
+
+    monkeypatch.setattr(bank.fake, "list_deposits", flaky)
+    with pytest.raises(TransferRejected) as info:
+        bank.service.execute_pending(pending.transfer_id, customer_id=bank.customer_id)
+    assert info.value.retryable
+    assert bank.audit.get(pending.transfer_id).status is S.PENDING
+    result = bank.service.execute_pending(pending.transfer_id, customer_id=bank.customer_id)
+    assert result.succeeded
+
+
+def test_permanent_check_failure_cancels(bank):
+    pending = propose(bank)
+    bank.fake.delete_account(bank.savings.id)
+    with pytest.raises(TransferRejected) as info:
+        bank.service.execute_pending(pending.transfer_id, customer_id=bank.customer_id)
+    assert not info.value.retryable
+    assert bank.audit.get(pending.transfer_id).status is S.CANCELLED
+
+
+def test_destination_deleted_after_leg1_is_compensated(bank, monkeypatch):
+    """V1-03: the bank would accept the deposit for a deleted account; we must not send it."""
+    real = bank.fake.create_withdrawal
+
+    def withdraw_then_delete_destination(*args, **kwargs):
+        leg = real(*args, **kwargs)
+        bank.fake.delete_account(bank.savings.id)  # e.g. a reset running concurrently
+        return leg
+
+    monkeypatch.setattr(bank.fake, "create_withdrawal", withdraw_then_delete_destination)
+    result = transfer(bank)
+    assert result.status is S.COMPENSATED
+    assert "returned" in result.message
+    assert bank.fake.list_deposits(bank.savings.id) == []  # nothing sent into the void
+    assert compute_balance(bank.fake, bank.checking.id).current == 1000
+    assert "no longer exists" in last_detail(bank, result.transfer_id)

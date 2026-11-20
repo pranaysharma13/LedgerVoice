@@ -19,15 +19,18 @@ State machine (invalid jumps are refused, so a bug can't silently skip a step):
        └──> EXPIRED
 
 PENDING / CANCELLED / EXPIRED are used by the confirmation flow (M1d).
-RESOLVED records that a human checked and fixed a NEEDS_ATTENTION transfer; it
-requires a note saying what was done (R1-05).
+RESOLVED records that a human checked and fixed a NEEDS_ATTENTION transfer. It is only
+reachable through resolve(), which requires a note AND a snapshot of the leg ids the
+human saw in the bank, so reconcile can flag any leg that lands later (V1-02, D38).
 
 Safe to share between threads: one connection guarded by a lock (R1-08).
-The schema is versioned with PRAGMA user_version and migrated on open (R1-14).
+The schema is versioned with PRAGMA user_version and migrated on open; each migration
+step runs in its own IMMEDIATE transaction, so a failed step leaves no trace (V1-05).
 """
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 import threading
@@ -73,35 +76,36 @@ TERMINAL = frozenset(s for s, nxt in ALLOWED.items() if not nxt)
 INITIAL = frozenset({S.PENDING, S.EXECUTING})
 
 # Ordered migrations: entry i brings the schema from version i to version i + 1.
-# Never edit an entry once released; add a new one instead.
-_MIGRATIONS: list[str] = [
+# Each entry is a list of single SQL statements, applied in one transaction together
+# with the user_version bump. Never edit an entry once released; add a new one instead.
+_MIGRATIONS: list[list[str]] = [
     # v0 -> v1: initial schema
-    """
-    CREATE TABLE IF NOT EXISTS transfers (
-        transfer_id   TEXT PRIMARY KEY,
-        customer_id   TEXT NOT NULL,
-        from_account  TEXT NOT NULL,
-        to_account    TEXT NOT NULL,
-        amount        INTEGER NOT NULL CHECK (amount > 0),
-        status        TEXT NOT NULL,
-        withdrawal_id TEXT,
-        deposit_id    TEXT,
-        reversal_id   TEXT,
-        created_at    TEXT NOT NULL,
-        updated_at    TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS transfer_events (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        transfer_id TEXT NOT NULL REFERENCES transfers(transfer_id),
-        status      TEXT NOT NULL,
-        detail      TEXT NOT NULL DEFAULT '',
-        at          TEXT NOT NULL
-    );
-    """,
+    [
+        """CREATE TABLE IF NOT EXISTS transfers (
+            transfer_id   TEXT PRIMARY KEY,
+            customer_id   TEXT NOT NULL,
+            from_account  TEXT NOT NULL,
+            to_account    TEXT NOT NULL,
+            amount        INTEGER NOT NULL CHECK (amount > 0),
+            status        TEXT NOT NULL,
+            withdrawal_id TEXT,
+            deposit_id    TEXT,
+            reversal_id   TEXT,
+            created_at    TEXT NOT NULL,
+            updated_at    TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS transfer_events (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            transfer_id TEXT NOT NULL REFERENCES transfers(transfer_id),
+            status      TEXT NOT NULL,
+            detail      TEXT NOT NULL DEFAULT '',
+            at          TEXT NOT NULL
+        )""",
+    ],
     # v1 -> v2: index for per-customer queries (reconcile scope, M1d lookups)
-    """
-    CREATE INDEX IF NOT EXISTS idx_transfers_customer ON transfers (customer_id, status);
-    """,
+    ["CREATE INDEX IF NOT EXISTS idx_transfers_customer ON transfers (customer_id, status)"],
+    # v2 -> v3: snapshot of the leg ids a human saw when resolving (V1-02), JSON list
+    ["ALTER TABLE transfers ADD COLUMN resolution_leg_ids TEXT"],
 ]
 SCHEMA_VERSION = len(_MIGRATIONS)
 
@@ -123,6 +127,7 @@ class TransferRecord:
     reversal_id: str | None
     created_at: str
     updated_at: str
+    resolution_leg_ids: tuple[str, ...] | None = None  # set only by resolve()
 
 
 @dataclass(frozen=True)
@@ -153,19 +158,35 @@ class AuditLog:
             self._migrate()
 
     def _migrate(self) -> None:
-        version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+        version = self._read_version()
         if version > SCHEMA_VERSION:
             raise AuditError(
                 f"audit database schema v{version} is newer than this code (v{SCHEMA_VERSION})"
             )
         for target in range(version, SCHEMA_VERSION):
-            # executescript commits first, so each step is applied and recorded in turn
-            self._conn.executescript(_MIGRATIONS[target] + f"\nPRAGMA user_version = {target + 1};")
+            # One IMMEDIATE transaction per step: the statements and the version bump
+            # commit together or not at all. Re-reading the version inside the
+            # transaction means a second process that already applied it is skipped.
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                if self._read_version() > target:
+                    self._conn.rollback()
+                    continue
+                for statement in _MIGRATIONS[target]:
+                    self._conn.execute(statement)
+                self._conn.execute(f"PRAGMA user_version = {target + 1}")
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def _read_version(self) -> int:
+        return int(self._conn.execute("PRAGMA user_version").fetchone()[0])
 
     @property
     def schema_version(self) -> int:
         with self._lock:
-            return int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+            return self._read_version()
 
     def close(self) -> None:
         with self._lock:
@@ -218,17 +239,38 @@ class AuditLog:
         deposit_id: str | None = None,
         reversal_id: str | None = None,
     ) -> TransferRecord:
-        if new_status is S.RESOLVED and not detail.strip():
+        if new_status is S.RESOLVED:
+            raise AuditError(f"{transfer_id}: use resolve() to record a resolution")
+        return self._transition(
+            transfer_id,
+            new_status,
+            detail,
+            {"withdrawal_id": withdrawal_id, "deposit_id": deposit_id, "reversal_id": reversal_id},
+        )
+
+    def resolve(self, transfer_id: str, note: str, seen_leg_ids: list[str]) -> TransferRecord:
+        """NEEDS_ATTENTION -> RESOLVED, after a human checked the bank.
+
+        `note` says what was done; `seen_leg_ids` lists every bank record id the human
+        saw for this transfer (possibly empty). Reconcile flags any other leg that
+        appears later for this transfer as leg_after_resolution.
+        """
+        if not note.strip():
             raise AuditError(f"{transfer_id}: resolving requires a note saying what was done")
+        snapshot = json.dumps(sorted(set(seen_leg_ids)))
+        return self._transition(transfer_id, S.RESOLVED, note, {"resolution_leg_ids": snapshot})
+
+    def _transition(
+        self,
+        transfer_id: str,
+        new_status: TransferStatus,
+        detail: str,
+        fields: dict[str, str | None],
+    ) -> TransferRecord:
         current = self.get(transfer_id)
         if new_status not in ALLOWED[current.status]:
             raise AuditError(f"{transfer_id}: {current.status} -> {new_status} is not allowed")
-        legs = {
-            "withdrawal_id": withdrawal_id,
-            "deposit_id": deposit_id,
-            "reversal_id": reversal_id,
-        }
-        updates = {k: v for k, v in legs.items() if v is not None}
+        updates = {k: v for k, v in fields.items() if v is not None}
         ts = self._now().isoformat()
         sets = ", ".join(f"{column} = ?" for column in ("status", "updated_at", *updates))
         with self._lock, self._conn:
@@ -270,17 +312,25 @@ class AuditLog:
         status: TransferStatus | None = None,
         customer_ids: set[str] | frozenset[str] | None = None,
     ) -> list[TransferRecord]:
+        """Records, optionally filtered by status and/or customers (filtered in SQL)."""
+        where: list[str] = []
+        params: list[str] = []
+        if status is not None:
+            where.append("status = ?")
+            params.append(status)
+        if customer_ids is not None:
+            if not customer_ids:
+                return []
+            ids = sorted(customer_ids)
+            where.append(f"customer_id IN ({', '.join('?' for _ in ids)})")
+            params.extend(ids)
+        sql = "SELECT * FROM transfers"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY created_at, transfer_id"
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM transfers ORDER BY created_at, transfer_id"
-            ).fetchall()
-        records = [self._record(r) for r in rows]
-        return [
-            r
-            for r in records
-            if (status is None or r.status is status)
-            and (customer_ids is None or r.customer_id in customer_ids)
-        ]
+            rows = self._conn.execute(sql, params).fetchall()
+        return [self._record(r) for r in rows]
 
     def events(self, transfer_id: str) -> list[TransferEvent]:
         with self._lock:
@@ -308,4 +358,9 @@ class AuditLog:
             reversal_id=row["reversal_id"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            resolution_leg_ids=(
+                tuple(json.loads(row["resolution_leg_ids"]))
+                if row["resolution_leg_ids"] is not None
+                else None
+            ),
         )

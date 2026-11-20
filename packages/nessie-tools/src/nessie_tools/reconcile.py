@@ -10,12 +10,19 @@ the audit log recorded):
     COMPENSATED  leg 1 withdrawal + reversal deposit, no leg 2
     FAILED, PENDING, CANCELLED, EXPIRED   no legs at all
     NEEDS_ATTENTION                       always reported (a human must check)
-    RESOLVED                              a human checked it: legs are not judged
+    RESOLVED                              only the legs in the human's snapshot; any
+                                          other leg landed later (leg_after_resolution)
     EXECUTING, LEG1_DONE                  reported as stuck (crash mid-transfer)
+
+Account checks: every scanned account is looked up (D36: deleted accounts still list
+their transactions). A missing account is reported with the transfers that touch it;
+a checking or savings account whose computed balance is below $0 is reported as
+overdrawn, a safety net for concurrency bugs (V1-01).
 
 Scope (R1-07): pass customer_ids to check only those customers' transfers, e.g. the
 customers of the current seed. A leg is "unaudited" only if NO record in the whole
-audit log has its transfer id.
+audit log has its transfer id; a leg whose record exists but is out of scope is
+reported as out_of_scope_leg (V1-07).
 """
 
 from __future__ import annotations
@@ -29,8 +36,9 @@ from typing import Literal
 
 from nessie_tools.audit import AuditLog, TransferRecord, TransferStatus
 from nessie_tools.backend import BankBackend
+from nessie_tools.balances import compute_balance
 from nessie_tools.errors import NotFoundError
-from nessie_tools.models import TxStatus
+from nessie_tools.models import Account, AccountType, TxStatus
 from nessie_tools.transfers import LEG1_MARKER, LEG2_MARKER, REVERSAL_MARKER, TRANSFER_ID_PREFIX
 
 LegKind = Literal["leg1", "leg2", "reversal", "unknown"]
@@ -48,6 +56,9 @@ class ViolationKind(StrEnum):
     NEEDS_ATTENTION = "needs_attention"  # a transfer in NEEDS_ATTENTION
     STUCK_IN_PROGRESS = "stuck_in_progress"  # left in EXECUTING or LEG1_DONE
     ACCOUNT_MISSING = "account_missing"  # a scanned account no longer exists (legs still checked)
+    LEG_AFTER_RESOLUTION = "leg_after_resolution"  # a leg not in the resolution snapshot
+    OVERDRAWN = "overdrawn"  # checking/savings computed balance below $0
+    OUT_OF_SCOPE_LEG = "out_of_scope_leg"  # leg here, but its transfer is outside the scope
 
 
 V = ViolationKind
@@ -80,8 +91,8 @@ class ReconcileReport:
     def ok(self) -> bool:
         return not self.violations
 
-    def count(self, kind: ViolationKind) -> int:
-        return sum(1 for v in self.violations if v.kind is kind)
+    def count(self, kind: ViolationKind | str) -> int:
+        return sum(1 for v in self.violations if v.kind == kind)
 
 
 def _leg_kind(description: str, is_withdrawal: bool) -> LegKind:
@@ -136,22 +147,43 @@ def reconcile(
     for account_id in sorted(accounts):
         # Nessie lists happily return data for a deleted account (D36), so existence
         # is checked explicitly. The account's orphaned legs are still collected.
+        account: Account | None
         try:
-            backend.get_account(account_id)
+            account = backend.get_account(account_id)
         except NotFoundError:
-            report.violations.append(
-                Violation(V.ACCOUNT_MISSING, None, f"account {account_id} not found")
+            account = None
+            touching = sorted(
+                r.transfer_id for r in records if account_id in (r.from_account, r.to_account)
             )
+            detail = f"account {account_id} not found"
+            if touching:
+                detail += f"; transfers touching it: {', '.join(touching)}"
+            report.violations.append(Violation(V.ACCOUNT_MISSING, None, detail))
         legs = collect_legs(backend, account_id)
         report.legs_found += len(legs)
         for leg in legs:
             legs_by_tid[leg.transfer_id].append(leg)
+        if account is not None and account.type is not AccountType.CREDIT_CARD:
+            current = compute_balance(backend, account_id, account=account).current
+            if current < 0:
+                report.violations.append(
+                    Violation(V.OVERDRAWN, None, f"account {account_id} balance is ${current}")
+                )
 
+    in_scope = {r.transfer_id for r in records}
     audited = {r.transfer_id for r in all_records}
     for tid, legs in sorted(legs_by_tid.items()):
         if tid not in audited:
             report.violations.append(
                 Violation(V.UNAUDITED_LEG, tid, f"{len(legs)} leg(s) with no audit record")
+            )
+        elif tid not in in_scope:
+            report.violations.append(
+                Violation(
+                    V.OUT_OF_SCOPE_LEG,
+                    tid,
+                    f"{len(legs)} leg(s) in scanned accounts belong to an out-of-scope transfer",
+                )
             )
 
     for record in records:
@@ -164,7 +196,16 @@ def _check_record(record: TransferRecord, legs: list[Leg]) -> list[Violation]:
     out: list[Violation] = []
 
     if status is TransferStatus.RESOLVED:
-        return out
+        seen = set(record.resolution_leg_ids or ())
+        return [
+            Violation(
+                V.LEG_AFTER_RESOLUTION,
+                tid,
+                f"{leg.kind} {leg.record_id} (${leg.amount}) is not in the resolution snapshot",
+            )
+            for leg in legs
+            if leg.record_id not in seen
+        ]
     if status is TransferStatus.NEEDS_ATTENTION:
         return [Violation(V.NEEDS_ATTENTION, tid, "transfer needs a manual check")]
     if status in (TransferStatus.EXECUTING, TransferStatus.LEG1_DONE):

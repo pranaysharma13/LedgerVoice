@@ -43,7 +43,7 @@ def test_live_transfer_moves_money_and_reconciles(tmp_path):
         try:
             service = TransferService(bank, audit)
             pending = service.create_pending(customer.id, checking.id, savings.id, 25)
-            result = service.execute_pending(pending.transfer_id)
+            result = service.execute_pending(pending.transfer_id, customer_id=customer.id)
             assert result.status is TransferStatus.COMPLETED, result.message
             assert compute_balance(bank, checking.id).current == 275
             assert compute_balance(bank, savings.id).current == 125

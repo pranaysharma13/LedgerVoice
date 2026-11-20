@@ -17,7 +17,7 @@ def transfer(bank, amount):
     pending = bank.service.create_pending(
         bank.customer_id, bank.checking.id, bank.savings.id, amount
     )
-    return bank.service.execute_pending(pending.transfer_id)
+    return bank.service.execute_pending(pending.transfer_id, customer_id=bank.customer_id)
 
 
 def record(bank, tid, amount=30, status=S.EXECUTING):
@@ -37,11 +37,8 @@ def test_clean_history_has_no_violations(bank):
     transfer(bank, 20)  # compensated
     bank.fake.fail_next("create_withdrawal")
     transfer(bank, 10)  # failed
-    bank.service.cancel_pending(
-        bank.service.create_pending(
-            bank.customer_id, bank.checking.id, bank.savings.id, 5
-        ).transfer_id
-    )
+    pending = bank.service.create_pending(bank.customer_id, bank.checking.id, bank.savings.id, 5)
+    bank.service.cancel_pending(pending.transfer_id, customer_id=bank.customer_id)
 
     report = run(bank)
     assert report.ok, report.violations
@@ -144,7 +141,9 @@ def test_needs_attention_is_reported_until_resolved(bank):
     bank.fake.fail_next("create_deposit")
     tid = transfer(bank, 40).transfer_id
     assert run(bank).count(V.NEEDS_ATTENTION) == 1
-    bank.audit.transition(tid, S.RESOLVED, detail="manual deposit of $40 back into checking")
+    seen = [w.id for w in bank.fake.list_withdrawals(bank.checking.id)]
+    bank.fake.create_deposit(bank.checking.id, 40, DAY, "manual correction by ops")
+    bank.audit.resolve(tid, "deposited $40 back into checking by hand", seen)
     assert run(bank).ok
 
 
@@ -172,3 +171,55 @@ def test_customer_scope_ignores_other_runs(bank):
 def test_scoped_run_still_flags_unaudited_legs(bank):
     bank.fake.create_withdrawal(bank.checking.id, 9, DAY, "LV-TRF-0000beef x (leg 1/2)")
     assert run(bank, customer_ids=[bank.customer_id]).count(V.UNAUDITED_LEG) == 1
+
+
+def test_late_leg_after_resolution_is_flagged(bank):
+    """V1-02: resolved means 'checked at that moment', not 'ignore forever'."""
+    bank.fake.fail_next("create_withdrawal", appears_after_lists=100)
+    tid = transfer(bank, 50).transfer_id
+    assert bank.audit.get(tid).status is S.NEEDS_ATTENTION
+    bank.audit.resolve(tid, "checked the bank: no withdrawal found", seen_leg_ids=[])
+    assert run(bank).ok
+    bank.fake.flush_late_writes()  # the withdrawal lands after the human looked
+    report = run(bank)
+    assert report.count(V.LEG_AFTER_RESOLUTION) == 1
+
+
+def test_overdrawn_account_is_reported(bank):
+    """Safety net for concurrency bugs (V1-01)."""
+    bank.fake.create_withdrawal(bank.checking.id, 1200, DAY, "ATM")
+    assert run(bank).count(V.OVERDRAWN) == 1
+
+
+def test_credit_card_below_zero_is_not_overdrawn(bank):
+    from nessie_tools import AccountType
+
+    card = bank.fake.create_account(bank.customer_id, AccountType.CREDIT_CARD, "Card", 0)
+    merchant = bank.fake.create_merchant("Harvest Market", "groceries")
+    bank.fake.create_purchase(card.id, merchant.id, 80, DAY, "groceries")
+    assert reconcile(bank.fake, bank.audit, [card.id]).ok
+
+
+def test_out_of_scope_leg_in_a_scanned_account_is_flagged(bank):
+    """V1-07: another customer's transfer leaving a leg in our account must not be silent."""
+    bank.audit.create(
+        "LV-TRF-00000c01", "someone-else", "their-acct", bank.savings.id, 9, status=S.EXECUTING
+    )
+    bank.fake.create_deposit(bank.savings.id, 9, DAY, "LV-TRF-00000c01 x (leg 2/2)")
+    report = run(bank, customer_ids=[bank.customer_id])
+    assert report.count(V.OUT_OF_SCOPE_LEG) == 1
+
+
+def test_missing_account_names_the_transfers_touching_it(bank):
+    tid = transfer(bank, 5).transfer_id
+    bank.fake.delete_account(bank.savings.id)
+    [violation] = [v for v in run(bank).violations if v.kind is V.ACCOUNT_MISSING]
+    assert tid in violation.detail
+
+
+def test_count_accepts_plain_strings(bank):
+    """V1-09: a typo-free string works too; a typo can't silently match anything."""
+    bank.fake.create_withdrawal(bank.checking.id, 75, DAY, "LV-TRF-deadbeef sneaky (leg 1/2)")
+    report = run(bank)
+    assert report.count("unaudited_leg") == 1
+    assert report.count("unaudited_legs") == 0

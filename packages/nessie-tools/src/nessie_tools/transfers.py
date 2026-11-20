@@ -1,9 +1,10 @@
 """Transfers between a customer's own accounts, run as a saga (decision D15).
 
 Two-step API (R1-01, decision D34): there is NO way to move money in one call.
-    create_pending(...)        pre-checks, then records a PENDING transfer; no money moves
-    execute_pending(id)        runs an existing PENDING transfer, and nothing else
-    cancel_pending(id, ...)    PENDING -> CANCELLED or EXPIRED
+    create_pending(...)                       pre-checks, then records a PENDING transfer
+    execute_pending(id, customer_id=...)      runs an existing PENDING transfer, nothing else
+    cancel_pending(id, customer_id=..., ...)  PENDING -> CANCELLED or EXPIRED
+Both take the customer id, so a session can only act on its own transfers (V1-06).
 The confirmation flow (M1d) sits between the two steps: only a user's explicit yes,
 checked by code, leads to execute_pending. An unknown or invented id is rejected.
 
@@ -27,6 +28,11 @@ is still processing the write, and the write can land AFTER we look for it. So:
 - if it is still not found, the outcome is UNKNOWN and the transfer goes to
   NEEDS_ATTENTION. We never conclude FAILED, and never compensate, on a guess.
 
+Concurrency (V1-01, decision D37): one lock per source account, shared by every
+TransferService in the process, so the funds check and the writes for an account never
+interleave. Run ONE process per audit database; reconcile also reports overdrawn
+accounts as a safety net.
+
 Known limitation (R1-12, accepted): if the local audit write itself fails right after
 a bank write (e.g. disk full), the exception propagates and the record stays in
 EXECUTING or LEG1_DONE. reconcile reports it as stuck_in_progress.
@@ -46,7 +52,7 @@ from typing import Literal
 from nessie_tools.audit import AuditLog, TransferRecord, TransferStatus
 from nessie_tools.backend import BankBackend
 from nessie_tools.balances import compute_balance
-from nessie_tools.errors import BankError, LedgerError, is_ambiguous
+from nessie_tools.errors import BankError, LedgerError, NotFoundError, is_ambiguous
 from nessie_tools.models import Account, Deposit, Withdrawal
 from nessie_tools.money import require_whole_dollars
 
@@ -61,6 +67,19 @@ REVERSAL_MARKER = "(reversal of leg 1/2)"
 # then wait a little longer each time (~3.5 s worst case).
 DEFAULT_RECHECK_DELAYS: tuple[float, ...] = (0.0, 0.5, 1.0, 2.0)
 DETAIL_MAX = 200
+
+
+# Process-wide: every TransferService instance shares these (V1-01).
+_ACCOUNT_LOCKS: dict[str, threading.Lock] = {}
+_ACCOUNT_LOCKS_GUARD = threading.Lock()
+
+
+@contextmanager
+def _account_lock(account_id: str) -> Iterator[None]:
+    with _ACCOUNT_LOCKS_GUARD:
+        lock = _ACCOUNT_LOCKS.setdefault(account_id, threading.Lock())
+    with lock:
+        yield
 
 
 def new_transfer_id() -> str:
@@ -80,7 +99,16 @@ def reversal_description(transfer_id: str) -> str:
 
 
 class TransferRejected(LedgerError):
-    """A check failed before any money moved. The bank was not written to."""
+    """A check failed before any money moved. The bank was not written to.
+
+    retryable=True means the check could not be completed (e.g. the bank was briefly
+    unreachable), not that the answer was no. At execution time such a transfer stays
+    PENDING, so the caller can try again without asking the user twice (V1-04).
+    """
+
+    def __init__(self, message: str, *, retryable: bool = False):
+        super().__init__(message)
+        self.retryable = retryable
 
 
 @dataclass(frozen=True)
@@ -122,10 +150,6 @@ class TransferService:
         self._new_id = new_id
         self._recheck_delays = tuple(recheck_delays)
         self._sleep = sleep
-        # One lock per source account: the balance check and the writes for the same
-        # account never interleave, so two transfers can't both spend the same money.
-        self._locks: dict[str, threading.Lock] = {}
-        self._locks_guard = threading.Lock()
 
     # --- step 1: propose ---------------------------------------------------------
     def create_pending(
@@ -143,33 +167,39 @@ class TransferService:
         )
 
     def cancel_pending(
-        self, transfer_id: str, *, expired: bool = False, reason: str = ""
+        self, transfer_id: str, *, customer_id: str, expired: bool = False, reason: str = ""
     ) -> TransferRecord:
-        """PENDING -> CANCELLED (or EXPIRED). Raises TransferRejected if not PENDING."""
-        record = self._require_pending(transfer_id)
+        """PENDING -> CANCELLED (or EXPIRED). Raises TransferRejected if not PENDING
+        or not this customer's transfer."""
+        record = self._require_pending(transfer_id, customer_id)
         status = S.EXPIRED if expired else S.CANCELLED
         return self._audit.transition(record.transfer_id, status, detail=_clip(reason))
 
     # --- step 2: execute ---------------------------------------------------------
-    def execute_pending(self, transfer_id: str) -> TransferResult:
-        """Run an existing PENDING transfer. Anything else is rejected.
+    def execute_pending(self, transfer_id: str, *, customer_id: str) -> TransferResult:
+        """Run an existing PENDING transfer belonging to `customer_id`. Anything else is
+        rejected.
 
         Accounts and funds are checked again, because things may have changed since
-        the transfer was proposed; if a check fails now, the transfer is CANCELLED and
-        TransferRejected is raised. Otherwise a TransferResult is returned.
+        the transfer was proposed. If a check says no, the transfer is CANCELLED and
+        TransferRejected is raised. If a check could not be completed (retryable), the
+        transfer stays PENDING and TransferRejected(retryable=True) is raised.
         """
-        record = self._require_pending(transfer_id)
-        with self._account_lock(record.from_account):
-            record = self._require_pending(transfer_id)  # re-read under the lock
+        record = self._require_pending(transfer_id, customer_id)
+        with _account_lock(record.from_account):
+            record = self._require_pending(transfer_id, customer_id)  # re-read under the lock
             try:
                 src, dst = self._check_accounts(
                     record.customer_id, record.from_account, record.to_account
                 )
                 self._check_funds(src, record.amount)
             except TransferRejected as exc:
-                self._audit.transition(
-                    transfer_id, S.CANCELLED, detail=_clip(f"checks failed at execution: {exc}")
-                )
+                if not exc.retryable:
+                    self._audit.transition(
+                        transfer_id,
+                        S.CANCELLED,
+                        detail=_clip(f"checks failed at execution: {exc}"),
+                    )
                 raise
             self._audit.transition(transfer_id, S.EXECUTING, detail="confirmed; executing")
             return self._run_legs(record, src, dst)
@@ -196,14 +226,18 @@ class TransferService:
             tid, S.LEG1_DONE, detail="withdrawal written", withdrawal_id=leg1.leg.id
         )
 
-        # leg 2: deposit
+        # leg 2: deposit. The bank accepts deposits to deleted accounts (D36), so make
+        # sure the destination still exists right before writing (V1-03).
         desc2 = leg2_description(tid, src.last4)
-        leg2 = self._write_leg(
-            lambda: self._bank.create_deposit(dst.id, amount, when, desc2),
-            lambda: self._bank.list_deposits(dst.id),
-            desc2,
-            amount,
-        )
+        if self._account_gone(dst.id):
+            leg2 = _Outcome("not_written", reason="destination account no longer exists")
+        else:
+            leg2 = self._write_leg(
+                lambda: self._bank.create_deposit(dst.id, amount, when, desc2),
+                lambda: self._bank.list_deposits(dst.id),
+                desc2,
+                amount,
+            )
         if leg2.kind == "written" and leg2.leg is not None:
             return self._finish(
                 tid, S.COMPLETED, "deposit written", src, dst, deposit_id=leg2.leg.id
@@ -306,13 +340,24 @@ class TransferService:
         except BankError as exc:
             raise TransferRejected(str(exc)) from None
 
-    def _require_pending(self, transfer_id: str) -> TransferRecord:
+    def _require_pending(self, transfer_id: str, customer_id: str) -> TransferRecord:
         record = self._audit.find(transfer_id)
-        if record is None:
+        if record is None or record.customer_id != customer_id:
+            # Same message either way: don't reveal other customers' transfer ids.
             raise TransferRejected(f"no transfer {transfer_id!r} is waiting for confirmation")
         if record.status is not S.PENDING:
             raise TransferRejected(f"{transfer_id} is {record.status}, not PENDING")
         return record
+
+    def _account_gone(self, account_id: str) -> bool:
+        """True only if the bank says the account doesn't exist (a failed check is not proof)."""
+        try:
+            self._bank.get_account(account_id)
+        except NotFoundError:
+            return True
+        except BankError:
+            return False
+        return False
 
     def _check_accounts(
         self, customer_id: str, from_account_id: str, to_account_id: str
@@ -322,8 +367,10 @@ class TransferService:
         try:
             src = self._bank.get_account(from_account_id)
             dst = self._bank.get_account(to_account_id)
+        except NotFoundError as exc:
+            raise TransferRejected(f"account not found: {exc}") from None
         except BankError as exc:
-            raise TransferRejected(f"account lookup failed: {exc}") from None
+            raise TransferRejected(f"account lookup failed: {exc}", retryable=True) from None
         if src.customer_id != customer_id or dst.customer_id != customer_id:
             raise TransferRejected("both accounts must belong to the customer")
         return src, dst
@@ -332,16 +379,9 @@ class TransferService:
         try:
             available = compute_balance(self._bank, src.id, account=src).current
         except BankError as exc:
-            raise TransferRejected(f"could not read the balance: {exc}") from None
+            raise TransferRejected(f"could not read the balance: {exc}", retryable=True) from None
         if amount > available:
             raise TransferRejected(f"insufficient funds: ${available} available")
-
-    @contextmanager
-    def _account_lock(self, account_id: str) -> Iterator[None]:
-        with self._locks_guard:
-            lock = self._locks.setdefault(account_id, threading.Lock())
-        with lock:
-            yield
 
 
 def _clip(text: str) -> str:

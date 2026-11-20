@@ -30,7 +30,6 @@ def test_create_and_happy_path_history():
         (S.EXECUTING, S.COMPLETED),  # can't skip leg 1
         (S.PENDING, S.LEG1_DONE),  # can't skip execution
         (S.EXECUTING, S.COMPENSATED),  # nothing to compensate before leg 1
-        (S.EXECUTING, S.RESOLVED),  # only NEEDS_ATTENTION can be resolved
     ],
 )
 def test_forbidden_jumps_are_refused(start, jump):
@@ -49,16 +48,26 @@ def test_terminal_states_are_final():
             audit.transition(TID, S.LEG1_DONE)
 
 
-def test_needs_attention_can_be_resolved_with_a_note():
+def test_needs_attention_is_resolved_only_via_resolve():
     with AuditLog(":memory:") as audit:
         make(audit)
         audit.transition(TID, S.NEEDS_ATTENTION, detail="leg 1 outcome unknown")
+        with pytest.raises(AuditError, match="resolve"):
+            audit.transition(TID, S.RESOLVED, detail="sneaky")
         with pytest.raises(AuditError, match="note"):
-            audit.transition(TID, S.RESOLVED, detail="   ")
-        rec = audit.transition(TID, S.RESOLVED, detail="checked bank: withdrawal landed, fixed")
+            audit.resolve(TID, "   ", [])
+        rec = audit.resolve(TID, "checked bank: one withdrawal, refunded", ["w-2", "w-1"])
         assert rec.status is S.RESOLVED
+        assert rec.resolution_leg_ids == ("w-1", "w-2")
         with pytest.raises(AuditError):
             audit.transition(TID, S.NEEDS_ATTENTION)
+
+
+def test_only_needs_attention_can_be_resolved():
+    with AuditLog(":memory:") as audit:
+        make(audit)
+        with pytest.raises(AuditError):
+            audit.resolve(TID, "note", [])
 
 
 def test_status_is_required_and_must_be_initial():
@@ -169,3 +178,51 @@ def test_records_filter_by_status_and_customer():
             "LV-TRF-00000002"
         ]
         assert len(audit.records()) == 3
+
+
+def test_failed_migration_step_leaves_no_trace(tmp_path, monkeypatch):
+    """V1-05: a step and its version bump commit together or not at all."""
+    from nessie_tools import audit as audit_module
+
+    path = tmp_path / "atomic.sqlite"
+    AuditLog(path).close()  # fully migrated
+    bad_step = ["ALTER TABLE transfers ADD COLUMN extra TEXT", "THIS IS NOT SQL"]
+    monkeypatch.setattr(audit_module, "_MIGRATIONS", [*audit_module._MIGRATIONS, bad_step])
+    monkeypatch.setattr(audit_module, "SCHEMA_VERSION", SCHEMA_VERSION + 1)
+    with pytest.raises(sqlite3.Error):
+        AuditLog(path)
+    conn = sqlite3.connect(path)
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(transfers)")]
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    conn.close()
+    assert "extra" not in columns  # the first statement was rolled back
+    assert version == SCHEMA_VERSION  # and the version was not bumped
+
+
+def test_v2_database_upgrades_to_v3_keeping_data(tmp_path, monkeypatch):
+    from nessie_tools import audit as audit_module
+
+    path = tmp_path / "v2.sqlite"
+    monkeypatch.setattr(audit_module, "_MIGRATIONS", audit_module._MIGRATIONS[:2])
+    monkeypatch.setattr(audit_module, "SCHEMA_VERSION", 2)
+    AuditLog(path).close()  # a v2 database, as an older release left it
+    monkeypatch.undo()
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "INSERT INTO transfers (transfer_id, customer_id, from_account, to_account, amount,"
+        " status, created_at, updated_at) VALUES (?, 'cust', 'a', 'b', 50, 'EXECUTING', 't', 't')",
+        (TID,),
+    )
+    conn.commit()
+    conn.close()
+    with AuditLog(path) as new:
+        assert new.schema_version == SCHEMA_VERSION
+        assert new.get(TID).resolution_leg_ids is None
+        new.transition(TID, S.NEEDS_ATTENTION, detail="x")
+        assert new.resolve(TID, "fixed", ["w-1"]).resolution_leg_ids == ("w-1",)
+
+
+def test_records_with_an_empty_customer_scope_is_empty():
+    with AuditLog(":memory:") as audit:
+        make(audit)
+        assert audit.records(customer_ids=set()) == []
