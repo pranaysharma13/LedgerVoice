@@ -275,6 +275,16 @@ def test_nessie_bill_without_recurring_date_breaks_the_bill_list() -> None:
         client.close()
 
 
+def test_customer_round_trip(world: World) -> None:
+    """M1c-2 reuses seed customers across reseeds, so it must be able to look them up."""
+    b = world.backend
+    customer = b.create_customer("Casey", "Contract", ADDRESS)
+    found = b.get_customer(customer.id)
+    assert (found.id, found.first_name, found.last_name) == (customer.id, "Casey", "Contract")
+    with pytest.raises(NotFoundError):
+        b.get_customer(str(uuid.uuid4()))
+
+
 def test_bank_accepts_an_account_for_an_unknown_customer(world: World) -> None:
     """D47 (verified live 2026-11-23): account creation doesn't check the customer.
     The seeder must only use customer ids it created itself."""

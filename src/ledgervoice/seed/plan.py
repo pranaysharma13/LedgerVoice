@@ -98,6 +98,31 @@ class SeedPlan:
     def accounts_of(self, customer_key: str) -> list[PlanAccount]:
         return [a for a in self.accounts if a.customer_key == customer_key]
 
+    def subset(self, customer_key: str, max_transactions: int) -> SeedPlan:
+        """A small, self-consistent plan: one customer, their accounts, their first
+        `max_transactions` transactions, the merchants those use, and the bills whose
+        paying purchase is kept (or that move no money). Used by the live seed test."""
+        accounts = tuple(a for a in self.accounts if a.customer_key == customer_key)
+        keys = {a.key for a in accounts}
+        txs = tuple(t for t in self.transactions if t.account_key in keys)[:max_transactions]
+        kept = {t.key for t in txs}
+        bills = tuple(
+            b
+            for b in self.bills
+            if b.account_key in keys and (b.paid_by_tx_key is None or b.paid_by_tx_key in kept)
+        )
+        used = {t.merchant_key for t in txs if t.merchant_key is not None}
+        return SeedPlan(
+            seed=self.seed,
+            anchor=self.anchor,
+            start=self.start,
+            merchants=tuple(m for m in self.merchants if m.key in used),
+            customers=tuple(c for c in self.customers if c.key == customer_key),
+            accounts=accounts,
+            transactions=txs,
+            bills=bills,
+        )
+
     # --- canonical form ----------------------------------------------------------
     def to_dict(self) -> dict[str, Any]:
         plain: dict[str, Any] = _plain(asdict(self))

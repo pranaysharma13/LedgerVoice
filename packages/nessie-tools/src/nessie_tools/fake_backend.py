@@ -166,6 +166,12 @@ class FakeBackend:
 
         return self._run("create_customer", write)
 
+    def get_customer(self, customer_id: str) -> Customer:
+        customer = self._store.customers.get(customer_id)
+        if customer is None:
+            raise NotFoundError(f"customer {customer_id} not found")
+        return customer
+
     # --- accounts --------------------------------------------------------------
     def create_account(
         self, customer_id: str, type: AccountType, nickname: str, balance: int

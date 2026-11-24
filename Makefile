@@ -1,6 +1,6 @@
 PY := .venv/bin/python
 
-.PHONY: venv setup upgrade freeze test test-live lint seed-plan fmt smoke probe-nessie costs
+.PHONY: venv setup upgrade freeze test test-live lint seed-plan seed-live verify-seed reset-live fmt smoke probe-nessie costs
 
 venv:
 	python3.12 -m venv .venv
@@ -39,6 +39,18 @@ lint:
 # Example: make seed-plan ARGS="--seed 42 --anchor 2026-11-23"
 seed-plan:
 	$(PY) -m ledgervoice.seed plan $(ARGS)
+
+# M1c-2: the live seed. seed-live writes the plan to Nessie and verifies it; verify-seed
+# re-checks it; reset-live deletes exactly the seed's accounts (never DELETE /data).
+# Example: make seed-live ARGS="--seed 42 --anchor 2026-11-23"
+seed-live:
+	$(PY) -m ledgervoice.seed apply $(ARGS)
+
+verify-seed:
+	$(PY) -m ledgervoice.seed verify
+
+reset-live:
+	$(PY) -m ledgervoice.seed reset
 
 fmt:
 	$(PY) -m ruff format .

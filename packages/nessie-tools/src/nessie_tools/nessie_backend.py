@@ -130,6 +130,10 @@ class NessieBackend:
         }
         return self._create("/customers", payload, Customer)
 
+    def get_customer(self, customer_id: str) -> Customer:
+        path = f"/customers/{customer_id}"
+        return self._parse(Customer, self._get(path), f"GET {path}")
+
     # --- accounts --------------------------------------------------------------
     def create_account(
         self, customer_id: str, type: AccountType, nickname: str, balance: int

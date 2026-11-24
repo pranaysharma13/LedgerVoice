@@ -18,9 +18,7 @@ from pathlib import Path
 import pytest
 from nessie_tools import (
     AccountType,
-    Address,
     BillStatus,
-    FakeBackend,
     TxStatus,
     compute_balance,
 )
@@ -38,6 +36,7 @@ from ledgervoice.seed import (
     generate,
 )
 from ledgervoice.seed.__main__ import main as seed_cli
+from ledgervoice.seed.apply import seed_fake
 
 SEED, ANCHOR = 42, date(2026, 11, 23)
 # Pinned on purpose: any change to the generator or the catalog changes the data every
@@ -342,50 +341,9 @@ def test_a_persona_that_cannot_pay_rent_fails_loudly(monkeypatch: pytest.MonkeyP
 
 
 # --- ground truth agrees with the bank ---------------------------------------------
-ADDRESS = Address(
-    street_number="1", street_name="Seed Street", city="Testville", state="VA", zip="22101"
-)
-
-
-def _write_to_fake(plan: SeedPlan) -> tuple[FakeBackend, dict[str, str]]:
-    """A minimal applier for this test only (the real one, with a manifest and
-    read-back verification, is M1c-2)."""
-    bank = FakeBackend(seed=7)
-    ids: dict[str, str] = {}
-    for m in plan.merchants:
-        ids[m.key] = bank.create_merchant(m.name, m.category).id
-    for c in plan.customers:
-        ids[c.key] = bank.create_customer(c.first_name, c.last_name, ADDRESS).id
-    for a in plan.accounts:
-        ids[a.key] = bank.create_account(
-            ids[a.customer_key], a.type, a.nickname, a.opening_balance
-        ).id
-    for tx in plan.transactions:
-        acc = ids[tx.account_key]
-        if tx.kind is TxKind.PURCHASE:
-            assert tx.merchant_key is not None
-            bank.create_purchase(
-                acc, ids[tx.merchant_key], tx.amount, tx.day, tx.description, tx.status
-            )
-        elif tx.kind is TxKind.DEPOSIT:
-            bank.create_deposit(acc, tx.amount, tx.day, tx.description, tx.status)
-        else:
-            bank.create_withdrawal(acc, tx.amount, tx.day, tx.description, tx.status)
-    for b in plan.bills:
-        bank.create_bill(
-            ids[b.account_key],
-            b.payee,
-            b.nickname,
-            b.amount,
-            b.payment_date,
-            b.recurring_day,
-            status=b.status,
-        )
-    return bank, ids
-
-
 def test_truth_matches_the_bank(plan: SeedPlan, truth: GroundTruth) -> None:
-    bank, ids = _write_to_fake(plan)
+    bank, manifest = seed_fake(plan)  # the real applier (M1c-2)
+    ids = {**manifest.merchants, **manifest.accounts}
     category_of = {m.id: m.category for m in bank.list_merchants()}
     for account in plan.accounts:
         computed = compute_balance(bank, ids[account.key]).current

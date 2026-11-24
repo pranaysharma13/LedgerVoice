@@ -43,6 +43,8 @@ class BankBackend(Protocol):
     # --- customers -------------------------------------------------------------
     def create_customer(self, first_name: str, last_name: str, address: Address) -> Customer: ...
 
+    def get_customer(self, customer_id: str) -> Customer: ...  # NotFoundError if unknown
+
     # --- accounts --------------------------------------------------------------
     def create_account(
         self, customer_id: str, type: AccountType, nickname: str, balance: int
