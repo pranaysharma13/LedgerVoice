@@ -46,5 +46,8 @@ addopts = "-m 'not live'"
 [tool.mypy]
 python_version = "3.12"
 plugins = ["pydantic.mypy"]
-files = ["packages/nessie-tools/src"]
+# D44: strict for all source code. Tests get a second, non-strict run from `make lint`
+# (see Makefile: MYPY_TESTS_FLAGS) so calls to removed or renamed APIs are caught
+# without annotating every test and fixture.
+files = ["packages/nessie-tools/src", "src/ledgervoice"]
 strict = true

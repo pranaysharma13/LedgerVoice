@@ -163,7 +163,7 @@ def test_leg1_unverifiable_needs_attention(bank, monkeypatch):
     def timeout(*args, **kwargs):
         raise NessieError("ReadTimeout")
 
-    attempted = []
+    attempted: list[bool] = []
     real_list = bank.fake.list_withdrawals
 
     def list_down_after_write(account_id):

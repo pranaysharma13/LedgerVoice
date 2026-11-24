@@ -6,6 +6,11 @@ resettable. It deliberately copies Nessie's behavior, including the quirks:
 - no referential integrity (D36, verified live 2026-11-20): deleting an account
   keeps its transactions; transactions and bills can be created for an account id
   that doesn't exist; listing an unknown account returns what is stored, or []
+- creates check almost nothing (D47, verified live 2026-11-23): an account can be
+  created under a customer id that doesn't exist, and a purchase with a merchant id
+  that doesn't exist. Bill status IS validated (BillStatus only). A bill without a
+  recurring_date is accepted by Nessie but breaks listing that account's bills (D49);
+  both backends require it, so our code can't create one.
 - get/delete of an unknown account or merchant raises NotFoundError
 
 It adds one thing Nessie doesn't have: failure injection, so tests can make a
@@ -29,12 +34,14 @@ from nessie_tools.models import (
     AccountType,
     Address,
     Bill,
+    BillStatus,
     Customer,
     Deposit,
     Merchant,
     Purchase,
     TxStatus,
     Withdrawal,
+    require_recurring_day,
 )
 from nessie_tools.money import require_whole_dollars
 
@@ -164,8 +171,7 @@ class FakeBackend:
         self, customer_id: str, type: AccountType, nickname: str, balance: int
     ) -> Account:
         balance = require_whole_dollars(balance, allow_zero=True)
-        if customer_id not in self._store.customers:
-            raise NotFoundError(f"customer {customer_id} not found")
+        # No customer check: Nessie accepts unknown customer ids (D47).
 
         def write() -> Account:
             account = Account(
@@ -224,7 +230,8 @@ class FakeBackend:
         status: TxStatus = TxStatus.COMPLETED,
     ) -> Purchase:
         amount = require_whole_dollars(amount)
-        self._require_merchant(merchant_id)
+        # No merchant check: Nessie accepts unknown merchant ids (D47), so callers
+        # that need a category must verify the merchant themselves.
 
         def write() -> Purchase:
             purchase = Purchase(
@@ -306,10 +313,12 @@ class FakeBackend:
         nickname: str,
         payment_amount: int,
         payment_date: date,
-        recurring_date: int | None = None,
-        status: str = "pending",
+        recurring_date: int,
+        status: BillStatus = BillStatus.PENDING,
     ) -> Bill:
         payment_amount = require_whole_dollars(payment_amount)
+        recurring_date = require_recurring_day(recurring_date)  # D49
+        status = BillStatus(status)  # Nessie rejects any other value (D47)
 
         def write() -> Bill:
             bill = Bill(

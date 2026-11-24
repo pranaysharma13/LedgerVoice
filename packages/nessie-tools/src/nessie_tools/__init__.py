@@ -38,12 +38,14 @@ from nessie_tools.models import (
     AccountType,
     Address,
     Bill,
+    BillStatus,
     Customer,
     Deposit,
     Merchant,
     Purchase,
     TxStatus,
     Withdrawal,
+    require_recurring_day,
 )
 from nessie_tools.money import require_whole_dollars
 from nessie_tools.nessie_backend import NessieBackend
@@ -68,6 +70,7 @@ __all__ = [
     "BankBackend",
     "BankError",
     "Bill",
+    "BillStatus",
     "Customer",
     "Deposit",
     "FakeBackend",
@@ -96,5 +99,6 @@ __all__ = [
     "new_transfer_id",
     "reconcile",
     "redact_key",
+    "require_recurring_day",
     "require_whole_dollars",
 ]

@@ -29,6 +29,7 @@ from nessie_tools.models import (
     AccountType,
     Address,
     Bill,
+    BillStatus,
     Customer,
     Deposit,
     Merchant,
@@ -103,8 +104,8 @@ class BankBackend(Protocol):
         nickname: str,
         payment_amount: int,
         payment_date: date,
-        recurring_date: int | None = None,
-        status: str = "pending",
+        recurring_date: int,  # required: see require_recurring_day (D49)
+        status: BillStatus = BillStatus.PENDING,
     ) -> Bill: ...
 
     def list_bills(self, account_id: str) -> list[Bill]: ...

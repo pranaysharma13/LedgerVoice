@@ -22,10 +22,12 @@ from nessie_tools import (
     Address,
     AmountError,
     BankBackend,
+    BillStatus,
     FakeBackend,
     Merchant,
     NessieBackend,
     NessieClient,
+    NessieError,
     NotFoundError,
     TxStatus,
 )
@@ -165,6 +167,24 @@ def test_bill_round_trip(world: World) -> None:
     found = [x for x in b.list_bills(acc) if x.id == created.id]
     assert len(found) == 1
     assert (found[0].payee, found[0].payment_amount) == ("Contract Electric", 82)
+    assert found[0].status is BillStatus.PENDING
+
+
+@pytest.mark.parametrize("status", list(BillStatus))
+def test_every_bill_status_round_trips(world: World, status: BillStatus) -> None:
+    """D47: Nessie accepts exactly these four statuses and stores them as sent."""
+    b, acc = world.backend, world.checking.id
+    created = b.create_bill(acc, "Contract Water", f"water-{status}", 30, DAY, 9, status=status)
+    [found] = [x for x in b.list_bills(acc) if x.id == created.id]
+    assert found.status is status
+
+
+def test_unknown_bill_status_never_reaches_the_bank(world: World) -> None:
+    b, acc = world.backend, world.checking.id
+    count = len(b.list_bills(acc))
+    with pytest.raises(ValueError):
+        b.create_bill(acc, "Contract Gas", "gas", 40, DAY, 9, status="paid")  # type: ignore[arg-type]
+    assert len(b.list_bills(acc)) == count
 
 
 def test_non_whole_amount_never_reaches_the_bank(world: World) -> None:
@@ -211,3 +231,69 @@ def test_bank_accepts_transactions_for_unknown_accounts(world: World) -> None:
     assert [d.id for d in b.list_deposits(ghost)] == [deposit.id]
     with pytest.raises(NotFoundError):
         b.get_account(ghost)
+
+
+@pytest.mark.parametrize("day", [None, 0, 32, True])
+def test_bill_without_a_valid_recurring_day_never_reaches_the_bank(
+    world: World, day: object
+) -> None:
+    """D49: a bill without recurring_date would make this account's bill list unreadable
+    on Nessie, so both backends refuse it before sending anything."""
+    b, acc = world.backend, world.checking.id
+    count = len(b.list_bills(acc))
+    with pytest.raises(ValueError, match="recurring_date"):
+        b.create_bill(acc, "Contract Gas", "gas", 40, DAY, day)  # type: ignore[arg-type]
+    assert len(b.list_bills(acc)) == count
+
+
+@pytest.mark.live
+def test_nessie_bill_without_recurring_date_breaks_the_bill_list() -> None:
+    """D49, documented on the live server (2026-11-23): the create is accepted, then every
+    list of that account's bills fails with HTTP 400. Uses a throwaway account under a
+    made-up customer id (accepted, D47) and the raw client to bypass our own check; the
+    account is deleted afterwards. If this test starts failing, Nessie fixed the bug and
+    D49 can be relaxed."""
+    backend, client = _live_backend()
+    account = backend.create_account(str(uuid.uuid4()), AccountType.CHECKING, "Contract D49", 0)
+    try:
+        backend.create_bill(account.id, "Contract Power", "ok", 10, DAY, 5)
+        assert len(backend.list_bills(account.id)) == 1  # listing works with a valid bill
+        payload = {
+            "status": "pending",
+            "payee": "Contract Power",
+            "nickname": "no-recurring-date",
+            "payment_date": DAY.isoformat(),
+            "payment_amount": 10,
+        }
+        client.request("POST", f"/accounts/{account.id}/bills", json=payload)  # accepted
+        with pytest.raises(NessieError) as info:
+            backend.list_bills(account.id)
+        assert info.value.status_code == 400
+        assert "recurring_date" in (info.value.body or "")
+    finally:
+        backend.delete_account(account.id)
+        client.close()
+
+
+def test_bank_accepts_an_account_for_an_unknown_customer(world: World) -> None:
+    """D47 (verified live 2026-11-23): account creation doesn't check the customer.
+    The seeder must only use customer ids it created itself."""
+    b = world.backend
+    ghost_customer = str(uuid.uuid4())
+    account = b.create_account(ghost_customer, AccountType.CHECKING, "Contract Ghost", 0)
+    try:
+        assert b.get_account(account.id).id == account.id
+    finally:
+        b.delete_account(account.id)
+
+
+def test_bank_accepts_a_purchase_with_an_unknown_merchant(world: World) -> None:
+    """D47 (verified live 2026-11-23): the purchase is stored, but its merchant (and so
+    its category) can't be looked up. Seeding verifies merchants; spending tools must
+    report such purchases as category "unknown", never drop them."""
+    b, acc = world.backend, world.checking.id
+    ghost_merchant = str(uuid.uuid4())
+    purchase = b.create_purchase(acc, ghost_merchant, 3, DAY, "unknown merchant")
+    assert [p.id for p in b.list_purchases(acc) if p.id == purchase.id] == [purchase.id]
+    with pytest.raises(NotFoundError):
+        b.get_merchant(ghost_merchant)

@@ -119,7 +119,7 @@ def pcm_to_wav(pcm: bytes, sample_rate: int = SAMPLE_RATE) -> bytes:
 
 
 def wav_duration_seconds(data: bytes) -> float:
-    with wave.open(io.BytesIO(data)) as w:
+    with wave.open(io.BytesIO(data), "rb") as w:
         return w.getnframes() / float(w.getframerate())
 
 
@@ -155,13 +155,14 @@ def check_nessie(s: Settings, ledger: CostLedger) -> CheckResult:
 # --- Claude ----------------------------------------------------------------------
 def check_claude(s: Settings, ledger: CostLedger) -> CheckResult:
     import anthropic
+    from anthropic.types import ToolParam
 
     s.require("anthropic_api_key")
     assert s.anthropic_api_key is not None
     client = anthropic.Anthropic(
         api_key=s.anthropic_api_key.get_secret_value(), timeout=30.0, max_retries=0
     )
-    tools = [
+    tools: list[ToolParam] = [
         {
             "name": "get_account_balance",
             "description": "Get the current balance of one of the user's accounts.",
@@ -315,6 +316,7 @@ def _status(idx: Any) -> str:
 async def _moss(s: Settings, ledger: CostLedger) -> CheckResult:
     from moss import DocumentInfo, MossClient, QueryOptions
 
+    assert s.moss_project_id is not None  # check_moss requires both settings first
     assert s.moss_project_key is not None
     client = MossClient(s.moss_project_id, s.moss_project_key.get_secret_value())
     notes: list[str] = []

@@ -1,6 +1,6 @@
 PY := .venv/bin/python
 
-.PHONY: venv setup upgrade freeze test test-live lint fmt smoke probe-nessie costs
+.PHONY: venv setup upgrade freeze test test-live lint seed-plan fmt smoke probe-nessie costs
 
 venv:
 	python3.12 -m venv .venv
@@ -24,10 +24,21 @@ test:
 test-live:
 	$(PY) -m pytest -q -m live
 
+# D44: tests are type-checked without requiring annotations (catches calls to removed
+# or renamed APIs). Source code stays strict via [tool.mypy] in pyproject.toml.
+MYPY_TESTS_FLAGS = --allow-untyped-defs --allow-incomplete-defs --allow-untyped-calls \
+	--allow-untyped-decorators --allow-any-generics --no-warn-return-any --check-untyped-defs
+
 lint:
 	$(PY) -m ruff check .
 	$(PY) -m ruff format --check .
 	$(PY) -m mypy
+	$(PY) -m mypy $(MYPY_TESTS_FLAGS) packages/nessie-tools/tests tests
+
+# M1c-1: generate a seed plan + ground truth offline (nothing is written to any bank).
+# Example: make seed-plan ARGS="--seed 42 --anchor 2026-11-23"
+seed-plan:
+	$(PY) -m ledgervoice.seed plan $(ARGS)
 
 fmt:
 	$(PY) -m ruff format .

@@ -9,6 +9,7 @@ from nessie_tools import (
     Account,
     AccountType,
     AmountError,
+    BillStatus,
     NessieBackend,
     NessieClient,
     NessieDataError,
@@ -121,7 +122,8 @@ def test_amount_gate_runs_before_any_request():
         raise AssertionError("no request may be sent for an invalid amount")
 
     with pytest.raises(AmountError):
-        backend_with(handler).create_withdrawal("acc", 4.75, date(2026, 11, 1), "x")
+        # deliberately the wrong type: the gate must catch it at runtime too
+        backend_with(handler).create_withdrawal("acc", 4.75, date(2026, 11, 1), "x")  # type: ignore[arg-type]
 
 
 def test_injected_http_client_is_not_closed_by_nessie_client():
@@ -240,3 +242,66 @@ def test_malformed_purchase_makes_the_balance_unreadable_permanently():
         compute_balance(backend, "acc", account=account)
     assert info.value.status_code is None  # looks like a network error by status alone...
     assert not is_temporary(info.value)  # ...but is classified as permanent
+
+
+def test_create_reads_back_when_account_number_is_empty():
+    """V1-11: an empty string is as useless as a missing value; read the account back."""
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        if request.method == "POST":
+            return httpx.Response(
+                201, json={"objectCreated": {"_id": "acc-3", "account_number": ""}}
+            )
+        return httpx.Response(
+            200,
+            json={
+                "_id": "acc-3",
+                "type": "Checking",
+                "nickname": "c",
+                "balance": 0,
+                "customer_id": "cust-1",
+                "account_number": "1111222233334444",
+            },
+        )
+
+    account = backend_with(handler).create_account("cust-1", AccountType.CHECKING, "c", 0)
+    assert calls == ["POST", "GET"]
+    assert account.last4 == "4444"
+
+
+def test_bill_status_is_sent_as_its_plain_value():
+    sent = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.update(json.loads(request.content))
+        return httpx.Response(201, json={"objectCreated": {"_id": "b-1", **sent}})
+
+    bill = backend_with(handler).create_bill(
+        "acc", "Power", "power", 10, date(2026, 11, 1), 1, status=BillStatus.RECURRING
+    )
+    assert sent["status"] == "recurring"
+    assert bill.status is BillStatus.RECURRING
+
+
+@pytest.mark.parametrize("day", [None, 0, 32, True, "5"])
+def test_bill_without_a_valid_recurring_day_sends_nothing(day):
+    """D49: Nessie would accept it and then fail every bill list on the account."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("no request may be sent for a bill without a recurring day")
+
+    with pytest.raises(ValueError, match="recurring_date"):
+        backend_with(handler).create_bill("acc", "Power", "power", 10, date(2026, 11, 1), day)
+
+
+def test_bill_payload_always_carries_the_recurring_day():
+    sent = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.update(json.loads(request.content))
+        return httpx.Response(201, json={"objectCreated": {"_id": "b-2", **sent}})
+
+    backend_with(handler).create_bill("acc", "Power", "power", 10, date(2026, 11, 1), 31)
+    assert sent["recurring_date"] == 31

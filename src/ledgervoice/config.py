@@ -8,6 +8,7 @@ instead of the whole program crashing at import time.
 
 from __future__ import annotations
 
+from datetime import date
 from functools import lru_cache
 from pathlib import Path
 
@@ -45,9 +46,14 @@ class Settings(BaseSettings):
     moss_project_id: str | None = None
     moss_project_key: SecretStr | None = None
 
+    # Time (D23): pin "today" so answers like "last week" are reproducible. Unset means
+    # the real date. Seeds record the date they were generated for.
+    ledgervoice_today: date | None = None
+
     # Local paths
     cost_ledger_path: Path = Path(".ledger/costs.jsonl")
     artifacts_dir: Path = Path(".artifacts")
+    seed_dir: Path = Path(".data/seed")
 
     @field_validator("nessie_base_url")
     @classmethod

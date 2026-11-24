@@ -25,6 +25,7 @@ from nessie_tools import (
     Address,
     BankBackend,
     BankError,
+    BillStatus,
     NessieBackend,
     NessieClient,
     NessieError,
@@ -34,9 +35,9 @@ from nessie_tools import (
 ADDRESS = Address(
     street_number="1", street_name="Diag Street", city="Testville", state="VA", zip="22101"
 )
-# Candidate bill statuses. "lv-not-a-status" checks whether the field is validated at
-# all; if it is, the error body usually lists the allowed values.
-BILL_STATUSES = ("pending", "recurring", "cancelled", "completed", "lv-not-a-status")
+# An invalid status, sent raw (bypassing BillStatus, which now rejects it before any
+# request) to check that Nessie itself validates the field. Result 2026-11-23: it does.
+INVALID_BILL_STATUS = "lv-not-a-status"
 
 
 @dataclass(frozen=True)
@@ -54,7 +55,9 @@ def _error_detail(exc: BankError) -> str:
     return str(exc)[:300]
 
 
-def run(backend: BankBackend, today: date) -> list[Finding]:
+def run(backend: BankBackend, today: date, client: NessieClient | None = None) -> list[Finding]:
+    """Ask the three questions. `client` (live runs only) sends the invalid bill status
+    raw; without it that one probe is skipped."""
     findings: list[Finding] = []
     created_accounts: list[str] = []
     try:
@@ -97,8 +100,8 @@ def run(backend: BankBackend, today: date) -> list[Finding]:
             findings.append(Finding(q2, "ERROR", _error_detail(exc)))
 
         # Q3 -- which bill statuses are accepted, and what is stored
-        for status in BILL_STATUSES:
-            q3 = f"Q3 bill status {status!r}"
+        for status in BillStatus:
+            q3 = f"Q3 bill status {status.value!r}"
             try:
                 bill = backend.create_bill(
                     account.id, "LV Diag Power", f"diag-{status}", 10, today, 25, status=status
@@ -106,7 +109,24 @@ def run(backend: BankBackend, today: date) -> list[Finding]:
                 stored_status = next(
                     (b.status for b in backend.list_bills(account.id) if b.id == bill.id), None
                 )
-                findings.append(Finding(q3, "ACCEPTED", f"stored status: {stored_status!r}"))
+                stored_value = stored_status.value if stored_status else None
+                findings.append(Finding(q3, "ACCEPTED", f"stored status: {stored_value!r}"))
+            except BankError as exc:
+                findings.append(Finding(q3, "REJECTED", _error_detail(exc)))
+        q3 = f"Q3 bill status {INVALID_BILL_STATUS!r}"
+        if client is None:
+            findings.append(Finding(q3, "INFO", "skipped (needs the raw live client)"))
+        else:
+            payload = {
+                "status": INVALID_BILL_STATUS,
+                "payee": "LV Diag Power",
+                "nickname": "diag-invalid",
+                "payment_date": today.isoformat(),
+                "payment_amount": 10,
+            }
+            try:
+                client.request("POST", f"/accounts/{account.id}/bills", json=payload)
+                findings.append(Finding(q3, "ACCEPTED", "Nessie stored an invalid status"))
             except BankError as exc:
                 findings.append(Finding(q3, "REJECTED", _error_detail(exc)))
     finally:
@@ -129,7 +149,7 @@ def main() -> int:
     with NessieClient(
         settings.nessie_api_key.get_secret_value(), base_url=settings.nessie_base_url
     ) as client:
-        findings = run(NessieBackend(client), date.today())
+        findings = run(NessieBackend(client), date.today(), client)
     for f in findings:
         print(f"{f.question:<42} {f.answer:<9} {f.detail}")
     return 0

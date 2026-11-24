@@ -29,12 +29,14 @@ from nessie_tools.models import (
     AccountType,
     Address,
     Bill,
+    BillStatus,
     Customer,
     Deposit,
     Merchant,
     Purchase,
     TxStatus,
     Withdrawal,
+    require_recurring_day,
 )
 from nessie_tools.money import require_whole_dollars
 
@@ -141,7 +143,7 @@ class NessieBackend:
         account = self._create(
             f"/customers/{customer_id}/accounts", payload, Account, {"customer_id": customer_id}
         )
-        if not account.account_number:  # create response may omit it; read it back
+        if not account.account_number:  # missing or "" in the create response: read it back (V1-11)
             try:
                 account = self.get_account(account.id)
             except BankError:
@@ -246,18 +248,17 @@ class NessieBackend:
         nickname: str,
         payment_amount: int,
         payment_date: date,
-        recurring_date: int | None = None,
-        status: str = "pending",
+        recurring_date: int,
+        status: BillStatus = BillStatus.PENDING,
     ) -> Bill:
         payload: dict[str, Any] = {
-            "status": status,
+            "recurring_date": require_recurring_day(recurring_date),  # D49
+            "status": BillStatus(status).value,  # a bad value fails here, like Nessie's 400
             "payee": payee,
             "nickname": nickname,
             "payment_date": payment_date.isoformat(),
             "payment_amount": require_whole_dollars(payment_amount),
         }
-        if recurring_date is not None:
-            payload["recurring_date"] = recurring_date
         return self._create(f"/accounts/{account_id}/bills", payload, Bill)
 
     def list_bills(self, account_id: str) -> list[Bill]:

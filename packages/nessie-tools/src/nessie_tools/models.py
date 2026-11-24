@@ -38,6 +38,25 @@ class AccountType(StrEnum):
     CREDIT_CARD = "Credit Card"
 
 
+class BillStatus(StrEnum):
+    """The only bill statuses Nessie accepts (verified live 2026-11-23; anything else
+    is a 400). Bills never move money by themselves (D18, D48)."""
+
+    PENDING = "pending"
+    RECURRING = "recurring"
+    CANCELLED = "cancelled"
+    COMPLETED = "completed"
+
+
+def require_recurring_day(day: object) -> int:
+    """D49 (verified live 2026-11-23): Nessie accepts a bill without `recurring_date`,
+    but from then on listing that account's bills fails with HTTP 400 (its own response
+    model requires the field). So every bill we create carries a day of the month."""
+    if isinstance(day, bool) or not isinstance(day, int) or not 1 <= day <= 31:
+        raise ValueError(f"recurring_date must be a day of the month (1-31), got {day!r}")
+    return day
+
+
 class TxStatus(StrEnum):
     PENDING = "pending"
     CANCELLED = "cancelled"
@@ -117,4 +136,4 @@ class Bill(_Model):
     payment_amount: int
     payment_date: NessieDate | None = None
     recurring_date: int | None = None
-    status: str = "pending"  # Nessie's bill status values are not documented; kept as text
+    status: BillStatus = BillStatus.PENDING

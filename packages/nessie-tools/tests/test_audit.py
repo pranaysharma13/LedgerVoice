@@ -73,7 +73,7 @@ def test_only_needs_attention_can_be_resolved():
 def test_status_is_required_and_must_be_initial():
     with AuditLog(":memory:") as audit:
         with pytest.raises(TypeError):
-            audit.create(TID, "cust", "a", "b", 50)  # no status: refused (R1-24)
+            audit.create(TID, "cust", "a", "b", 50)  # type: ignore[call-arg]  # no status: refused (R1-24)
         with pytest.raises(AuditError):
             make(audit, status=S.COMPLETED)
 
@@ -94,7 +94,7 @@ def test_duplicate_id_is_refused_and_leaves_no_orphan_event():
 
 def test_non_whole_amount_is_refused():
     with AuditLog(":memory:") as audit, pytest.raises(ValueError):
-        audit.create(TID, "cust", "a", "b", 12.5, status=S.PENDING)
+        audit.create(TID, "cust", "a", "b", 12.5, status=S.PENDING)  # type: ignore[arg-type]  # deliberate
 
 
 def test_unknown_id():
