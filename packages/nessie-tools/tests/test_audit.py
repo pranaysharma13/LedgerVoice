@@ -226,3 +226,32 @@ def test_records_with_an_empty_customer_scope_is_empty():
     with AuditLog(":memory:") as audit:
         make(audit)
         assert audit.records(customer_ids=set()) == []
+
+
+def test_safety_events_are_logged_in_order_and_filtered_by_customer():
+    with AuditLog(":memory:") as audit:
+        audit.log_event("cust-1", "proposed", transfer_id=TID, detail="$50")
+        audit.log_event("cust-2", "rejected", detail="over the limit")  # no transfer at all
+        audit.log_event("cust-1", "confirmed", transfer_id=TID)
+        assert [e.kind for e in audit.safety_events("cust-1")] == ["proposed", "confirmed"]
+        assert [e.kind for e in audit.safety_events()] == ["proposed", "rejected", "confirmed"]
+        rejected = audit.safety_events("cust-2")[0]
+        assert (rejected.transfer_id, rejected.detail) == (None, "over the limit")
+        with pytest.raises(AuditError):
+            audit.log_event("cust-1", "")
+
+
+def test_v3_database_upgrades_to_v4_keeping_transfers(tmp_path, monkeypatch):
+    from nessie_tools import audit as audit_module
+
+    path = tmp_path / "v3.sqlite"
+    monkeypatch.setattr(audit_module, "_MIGRATIONS", audit_module._MIGRATIONS[:3])
+    monkeypatch.setattr(audit_module, "SCHEMA_VERSION", 3)
+    with AuditLog(path) as old:
+        make(old)
+    monkeypatch.undo()
+    with AuditLog(path) as new:
+        assert new.schema_version == SCHEMA_VERSION == 4
+        assert new.get(TID).status is S.EXECUTING
+        new.log_event("cust", "proposed", transfer_id=TID)
+        assert len(new.safety_events()) == 1

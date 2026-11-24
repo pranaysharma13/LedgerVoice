@@ -106,6 +106,19 @@ _MIGRATIONS: list[list[str]] = [
     ["CREATE INDEX IF NOT EXISTS idx_transfers_customer ON transfers (customer_id, status)"],
     # v2 -> v3: snapshot of the leg ids a human saw when resolving (V1-02), JSON list
     ["ALTER TABLE transfers ADD COLUMN resolution_leg_ids TEXT"],
+    # v3 -> v4: every safety decision of the conversation layer (M1d, D55), including
+    # ones that never create a transfer (rejected proposals, messages that weren't a yes)
+    [
+        """CREATE TABLE IF NOT EXISTS safety_events (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            at          TEXT NOT NULL,
+            customer_id TEXT NOT NULL,
+            transfer_id TEXT,
+            kind        TEXT NOT NULL CHECK (kind <> ''),
+            detail      TEXT NOT NULL DEFAULT ''
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_safety_events_customer ON safety_events (customer_id, id)",
+    ],
 ]
 SCHEMA_VERSION = len(_MIGRATIONS)
 
@@ -128,6 +141,18 @@ class TransferRecord:
     created_at: str
     updated_at: str
     resolution_leg_ids: tuple[str, ...] | None = None  # set only by resolve()
+
+
+@dataclass(frozen=True)
+class SafetyEvent:
+    """One decision of the conversation safety layer (M1d): proposed, confirmed,
+    cancelled, expired, rejected, ... `kind` is defined by the caller."""
+
+    customer_id: str
+    kind: str
+    transfer_id: str | None
+    detail: str
+    at: str
 
 
 @dataclass(frozen=True)
@@ -331,6 +356,33 @@ class AuditLog:
         with self._lock:
             rows = self._conn.execute(sql, params).fetchall()
         return [self._record(r) for r in rows]
+
+    def log_event(
+        self, customer_id: str, kind: str, *, transfer_id: str | None = None, detail: str = ""
+    ) -> None:
+        """Record a safety decision (D55). Never raises for an unknown transfer id: the
+        log must also capture things that never became a transfer."""
+        if not kind:
+            raise AuditError("a safety event needs a kind")
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO safety_events (at, customer_id, transfer_id, kind, detail)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (self._now().isoformat(), customer_id, transfer_id, kind, detail),
+            )
+
+    def safety_events(self, customer_id: str | None = None) -> list[SafetyEvent]:
+        sql = "SELECT customer_id, kind, transfer_id, detail, at FROM safety_events"
+        params: tuple[str, ...] = ()
+        if customer_id is not None:
+            sql += " WHERE customer_id = ?"
+            params = (customer_id,)
+        with self._lock:
+            rows = self._conn.execute(sql + " ORDER BY id", params).fetchall()
+        return [
+            SafetyEvent(r["customer_id"], r["kind"], r["transfer_id"], r["detail"], r["at"])
+            for r in rows
+        ]
 
     def events(self, transfer_id: str) -> list[TransferEvent]:
         with self._lock:

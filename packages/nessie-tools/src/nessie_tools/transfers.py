@@ -46,7 +46,7 @@ import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from typing import Literal
 
 from nessie_tools.audit import AuditLog, TransferRecord, TransferStatus
@@ -72,6 +72,7 @@ REVERSAL_MARKER = "(reversal of leg 1/2)"
 # Pauses before each look-up after an ambiguous write: first look immediately,
 # then wait a little longer each time (~3.5 s worst case).
 DEFAULT_RECHECK_DELAYS: tuple[float, ...] = (0.0, 0.5, 1.0, 2.0)
+DEFAULT_MAX_AGE = timedelta(minutes=2)  # D54: how long a proposal can wait for its "yes"
 DETAIL_MAX = 200
 
 
@@ -152,13 +153,19 @@ class TransferService:
         new_id: Callable[[], str] = new_transfer_id,
         recheck_delays: Sequence[float] = DEFAULT_RECHECK_DELAYS,
         sleep: Callable[[float], None] = time.sleep,
+        now: Callable[[], datetime] = lambda: datetime.now(UTC),
+        max_age: timedelta | None = DEFAULT_MAX_AGE,
     ) -> None:
+        """`max_age`: a pending transfer older than this can no longer be executed
+        (D54); None disables the check. `now` must be the same clock the AuditLog uses."""
         self._bank = backend
         self._audit = audit
         self._today = today
         self._new_id = new_id
         self._recheck_delays = tuple(recheck_delays)
         self._sleep = sleep
+        self._now = now
+        self._max_age = max_age
 
     # --- step 1: propose ---------------------------------------------------------
     def create_pending(
@@ -197,6 +204,7 @@ class TransferService:
         record = self._require_pending(transfer_id, customer_id)
         with _account_lock(record.from_account):
             record = self._require_pending(transfer_id, customer_id)  # re-read under the lock
+            self._refuse_if_expired(record)
             try:
                 src, dst = self._check_accounts(
                     record.customer_id, record.from_account, record.to_account
@@ -212,6 +220,21 @@ class TransferService:
                 raise
             self._audit.transition(transfer_id, S.EXECUTING, detail="confirmed; executing")
             return self._run_legs(record, src, dst)
+
+    def _refuse_if_expired(self, record: TransferRecord) -> None:
+        """D54: a "yes" can only confirm a recent proposal. A stale pending transfer is
+        marked EXPIRED, even if the caller (the conversation runtime) forgot to."""
+        if self._max_age is None:
+            return
+        age = self._now() - datetime.fromisoformat(record.created_at)
+        if age > self._max_age:
+            self._audit.transition(
+                record.transfer_id,
+                S.EXPIRED,
+                detail=f"expired: pending for {age.total_seconds():.0f}s "
+                f"(limit {self._max_age.total_seconds():.0f}s)",
+            )
+            raise TransferRejected("this transfer request has expired; please ask again")
 
     # --- the saga ------------------------------------------------------------------
     def _run_legs(self, record: TransferRecord, src: Account, dst: Account) -> TransferResult:

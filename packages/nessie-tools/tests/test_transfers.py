@@ -1,10 +1,12 @@
 """The transfer saga: the two-step API, every outcome branch, pre-checks, concurrency."""
 
 import threading
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from conftest import TODAY
 from nessie_tools import (
+    AuditLog,
     NessieDataError,
     NessieError,
     TransferRejected,
@@ -594,3 +596,47 @@ def test_unreadable_create_response_is_still_treated_as_possibly_written(bank, m
     assert len(bank.fake.list_withdrawals(bank.checking.id)) == 1
     assert balances(bank) == (950, 550)
     assert_reconciles(bank)
+
+
+class _Clock:
+    """One clock for the audit log and the service, moved by hand."""
+
+    def __init__(self) -> None:
+        self.t = datetime(2026, 11, 24, 12, 0, tzinfo=UTC)
+
+    def __call__(self) -> datetime:
+        return self.t
+
+
+def _timed_service(bank, max_age=timedelta(minutes=2)):
+    clock = _Clock()
+    audit = AuditLog(":memory:", now=clock)
+    service = TransferService(
+        bank.fake, audit, today=lambda: TODAY, sleep=lambda _: None, now=clock, max_age=max_age
+    )
+    pending = service.create_pending(bank.customer_id, bank.checking.id, bank.savings.id, 50)
+    return clock, audit, service, pending
+
+
+def test_a_fresh_proposal_can_be_executed(bank):
+    clock, audit, service, pending = _timed_service(bank)
+    clock.t += timedelta(seconds=119)
+    assert service.execute_pending(pending.transfer_id, customer_id=bank.customer_id).succeeded
+
+
+def test_a_stale_proposal_expires_instead_of_executing(bank):
+    """D54: even if the runtime forgot to expire it, nessie-tools refuses a stale yes."""
+    clock, audit, service, pending = _timed_service(bank)
+    clock.t += timedelta(minutes=2, seconds=1)
+    with pytest.raises(TransferRejected, match="expired") as info:
+        service.execute_pending(pending.transfer_id, customer_id=bank.customer_id)
+    assert not info.value.retryable
+    assert audit.get(pending.transfer_id).status is S.EXPIRED
+    assert "expired" in audit.events(pending.transfer_id)[-1].detail
+    assert bank.fake.list_withdrawals(bank.checking.id) == []  # no money moved
+
+
+def test_max_age_none_disables_the_check(bank):
+    clock, audit, service, pending = _timed_service(bank, max_age=None)
+    clock.t += timedelta(hours=5)
+    assert service.execute_pending(pending.transfer_id, customer_id=bank.customer_id).succeeded

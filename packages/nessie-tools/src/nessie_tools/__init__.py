@@ -14,6 +14,7 @@ Layers (bottom to top):
 from nessie_tools.audit import (
     AuditError,
     AuditLog,
+    SafetyEvent,
     TransferEvent,
     TransferRecord,
     TransferStatus,
@@ -83,6 +84,7 @@ __all__ = [
     "NotFoundError",
     "Purchase",
     "ReconcileReport",
+    "SafetyEvent",
     "TransferEvent",
     "TransferRecord",
     "TransferRejected",
