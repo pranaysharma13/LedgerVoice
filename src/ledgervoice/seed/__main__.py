@@ -214,17 +214,9 @@ def _require_manifest(store: SeedStore) -> Manifest:
 
 
 def _live_bank() -> tuple[BankBackend, str, Callable[[], None]]:
-    from nessie_tools import NessieBackend, NessieClient
+    from ledgervoice.livebank import open_live_bank
 
-    from ledgervoice.config import get_settings
-
-    settings = get_settings()
-    settings.require("nessie_api_key")
-    assert settings.nessie_api_key is not None
-    client = NessieClient(
-        settings.nessie_api_key.get_secret_value(), base_url=settings.nessie_base_url
-    )
-    return NessieBackend(client), settings.nessie_base_url, client.close
+    return open_live_bank()
 
 
 if __name__ == "__main__":

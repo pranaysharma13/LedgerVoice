@@ -27,7 +27,18 @@ from typing import Any
 
 # USD per single unit, keyed by (service, unit). None = not yet verified -> unpriced.
 # Fill these in from the providers' pricing pages and note the date you checked.
+_MTOK = 1_000_000
 PRICING: dict[tuple[str, str], float | None] = {
+    # Claude Haiku 5.5, prompts up to 100,000 tokens (checked 2026-11-27 on the Claude
+    # pricing page: base input $0.10, 5m cache writes $0.125, cache hits $0.01, output
+    # $0.50 per million tokens). Prompts over 100k cost 5x; the agent's model wrapper
+    # flags such calls (over_100k_price_tier) because this estimate would be too low.
+    # Cache writes are priced at the 5-minute rate, the TTL the agent uses.
+    ("anthropic/claude-haiku-5-5", "input_tokens"): 0.10 / _MTOK,
+    ("anthropic/claude-haiku-5-5", "cache_creation_input_tokens"): 0.125 / _MTOK,
+    ("anthropic/claude-haiku-5-5", "cache_read_input_tokens"): 0.01 / _MTOK,
+    ("anthropic/claude-haiku-5-5", "output_tokens"): 0.50 / _MTOK,
+    # M0 smoke checks record service "anthropic" without the model: left unpriced.
     ("anthropic", "input_tokens"): None,
     ("anthropic", "output_tokens"): None,
     ("anthropic", "cache_read_input_tokens"): None,

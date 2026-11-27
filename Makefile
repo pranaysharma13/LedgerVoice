@@ -1,6 +1,6 @@
 PY := .venv/bin/python
 
-.PHONY: venv setup upgrade freeze test test-live lint seed-plan seed-live verify-seed reset-live fmt smoke probe-nessie costs
+.PHONY: venv setup upgrade freeze test test-live lint seed-plan seed-live verify-seed reset-live chat chat-live fmt smoke probe-nessie costs
 
 venv:
 	python3.12 -m venv .venv
@@ -51,6 +51,16 @@ verify-seed:
 
 reset-live:
 	$(PY) -m ledgervoice.seed reset
+
+# M1e: talk to the agent in the terminal (calls Claude, so it costs a little).
+# chat: an in-memory demo bank seeded like the live one; nothing touches Nessie.
+# chat-live: the live seed from `make seed-live` (transfers are real sandbox writes).
+# Example: make chat ARGS="--persona marcus --timing"
+chat:
+	$(PY) -m ledgervoice.agent $(ARGS)
+
+chat-live:
+	$(PY) -m ledgervoice.agent --live $(ARGS)
 
 fmt:
 	$(PY) -m ruff format .
