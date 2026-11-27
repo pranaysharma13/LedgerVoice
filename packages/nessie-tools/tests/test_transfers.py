@@ -680,3 +680,91 @@ def test_a_card_payment_is_rechecked_at_execution(bank):
         bank.service.execute_pending(pending.transfer_id, customer_id=bank.customer_id)
     assert bank.audit.get(pending.transfer_id).status is S.CANCELLED
     assert bank.fake.list_withdrawals(bank.checking.id) == []
+
+
+def test_two_card_payments_at_once_cannot_overpay(bank, monkeypatch):
+    """V3-01: payments from two different sources into one card. The card's lock is
+    held too, so the second payment re-checks the amount owed after the first landed.
+    Deterministic: without the card lock both threads meet after the check."""
+    card = _card_owing(bank, 300)
+    first = bank.service.create_pending(bank.customer_id, bank.checking.id, card.id, 300)
+    second = bank.service.create_pending(bank.customer_id, bank.savings.id, card.id, 300)
+    meet = threading.Barrier(2, timeout=1.0)
+    real_check = bank.service._check_card_payment
+
+    def check_then_meet(dst, amount):
+        real_check(dst, amount)
+        try:
+            meet.wait()
+        except threading.BrokenBarrierError:
+            pass
+
+    monkeypatch.setattr(bank.service, "_check_card_payment", check_then_meet)
+    outcomes: list[object] = []
+
+    def run(tid):
+        try:
+            outcomes.append(bank.service.execute_pending(tid, customer_id=bank.customer_id))
+        except TransferRejected as exc:
+            outcomes.append(exc)
+
+    threads = [threading.Thread(target=run, args=(t.transfer_id,)) for t in (first, second)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    rejected = [o for o in outcomes if isinstance(o, TransferRejected)]
+    assert len(outcomes) == 2 and len(rejected) == 1
+    assert "nothing is owed" in str(rejected[0])
+    assert compute_balance(bank.fake, card.id).current == 0  # paid off, not overpaid
+
+
+class _MeetingLock:
+    """Wraps an account lock: right after a thread takes its FIRST such lock, it waits
+    (up to 1 s) for the other thread to take one too. If the two threads lock their
+    accounts in opposite orders, that interleaving is a guaranteed deadlock."""
+
+    def __init__(self, meet: threading.Barrier, held: threading.local) -> None:
+        self._lock = threading.Lock()
+        self._meet, self._held = meet, held
+
+    def __enter__(self):
+        self._lock.acquire()
+        if not getattr(self._held, "any", False):
+            self._held.any = True
+            try:
+                self._meet.wait()
+            except threading.BrokenBarrierError:
+                pass
+        return self
+
+    def __exit__(self, *exc):
+        self._lock.release()
+
+
+def test_opposite_transfers_at_once_do_not_deadlock(bank, monkeypatch):
+    """V3-01: both accounts are locked, always in sorted id order, so A->B and B->A
+    running together finish instead of waiting for each other forever."""
+    from nessie_tools import transfers as transfers_module
+
+    meet, held = threading.Barrier(2, timeout=1.0), threading.local()
+    for account in (bank.checking, bank.savings):
+        monkeypatch.setitem(transfers_module._ACCOUNT_LOCKS, account.id, _MeetingLock(meet, held))
+    a_to_b = bank.service.create_pending(bank.customer_id, bank.checking.id, bank.savings.id, 10)
+    b_to_a = bank.service.create_pending(bank.customer_id, bank.savings.id, bank.checking.id, 20)
+    done: list[str] = []
+
+    def run(tid):
+        held.any = False
+        bank.service.execute_pending(tid, customer_id=bank.customer_id)
+        done.append(tid)
+
+    threads = [
+        threading.Thread(target=run, args=(t.transfer_id,), daemon=True) for t in (a_to_b, b_to_a)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(5)
+    assert sorted(done) == sorted([a_to_b.transfer_id, b_to_a.transfer_id]), "deadlocked"
+    assert balances(bank) == (1010, 490)

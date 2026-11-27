@@ -28,10 +28,12 @@ is still processing the write, and the write can land AFTER we look for it. So:
 - if it is still not found, the outcome is UNKNOWN and the transfer goes to
   NEEDS_ATTENTION. We never conclude FAILED, and never compensate, on a guess.
 
-Concurrency (V1-01, decision D37): one lock per source account, shared by every
-TransferService in the process, so the funds check and the writes for an account never
-interleave. Run ONE process per audit database; reconcile also reports overdrawn
-accounts as a safety net.
+Concurrency (V1-01, decision D37): one lock per account, shared by every
+TransferService in the process. Executing a transfer holds the locks of BOTH its
+accounts (V3-01), taken in sorted id order so two transfers in opposite directions
+can't deadlock. So the funds check (source) and the card cap (destination) can't be
+passed by two transfers at once. Run ONE process per audit database; reconcile also
+reports overdrawn accounts as a safety net.
 
 Known limitation (R1-12, accepted): if the local audit write itself fails right after
 a bank write (e.g. disk full), the exception propagates and the record stays in
@@ -44,7 +46,7 @@ import secrets
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Literal
@@ -82,10 +84,15 @@ _ACCOUNT_LOCKS_GUARD = threading.Lock()
 
 
 @contextmanager
-def _account_lock(account_id: str) -> Iterator[None]:
+def _account_locks(*account_ids: str) -> Iterator[None]:
+    """Hold the lock of every given account, always acquired in sorted id order: any
+    two transfers take shared locks in the same order, so they can never wait for each
+    other in a cycle (no deadlock, V3-01)."""
     with _ACCOUNT_LOCKS_GUARD:
-        lock = _ACCOUNT_LOCKS.setdefault(account_id, threading.Lock())
-    with lock:
+        locks = [_ACCOUNT_LOCKS.setdefault(a, threading.Lock()) for a in sorted(set(account_ids))]
+    with ExitStack() as stack:
+        for lock in locks:
+            stack.enter_context(lock)
         yield
 
 
@@ -215,7 +222,7 @@ class TransferService:
         transfer stays PENDING and TransferRejected(retryable=True) is raised.
         """
         record = self._require_pending(transfer_id, customer_id)
-        with _account_lock(record.from_account):
+        with _account_locks(record.from_account, record.to_account):
             record = self._require_pending(transfer_id, customer_id)  # re-read under the lock
             self._refuse_if_expired(record)
             try:

@@ -200,6 +200,9 @@ class SafetySession:
 
     # --- step 2: the user answers ------------------------------------------------
     def on_user_message(self, text: str) -> Intercept:
+        """Call this for EVERY user message, before the model sees it, even when nothing
+        is pending: it also lifts the block on proposals after a double proposal
+        (V3-03). `pending_transfer_id is None` is not a reason to skip it."""
         with self._lock:
             self._blocked = False  # the user has spoken; proposals are allowed again
             pending = self._pending
@@ -323,15 +326,22 @@ class SafetySession:
         )
 
     def _abandon(self, transfer_id: str, why: str) -> Intercept:
-        """A log write failed before any money moved (V2-03): cancel, never execute."""
+        """A log write failed before any money moved (V2-03): cancel, never execute.
+        Only called before execute_pending, so the bank was never written to. If the
+        cancel also fails, the record stays PENDING: still nothing moved, and the
+        session no longer holds it; reconcile reports it as stale_pending (V3-02)."""
         status = self._cancel(transfer_id, why)
         log.error(
             "safety session %s: %s; transfer %s is %s", self.session_id, why, transfer_id, status
         )
+        if status in NOTHING_MOVED or status == TransferStatus.PENDING.value:
+            moved_reply, moved_note = "Nothing was moved.", "Nothing was moved."
+        else:  # can't happen before execution; never claim nothing moved if it does
+            moved_reply, moved_note = _moved_reply(status), _moved_note(status)
         return Intercept(
             handled=True,
-            reply=f"Something went wrong, so I didn't make that transfer. {_moved_reply(status)}",
-            note=f"The transfer was not made. {_moved_note(status)}",
+            reply=f"Something went wrong, so I didn't make that transfer. {moved_reply}",
+            note=f"The transfer was not made. {moved_note}",
         )
 
     def _refuse(self, reason: str) -> ProposeResult:

@@ -640,6 +640,26 @@ def test_if_the_confirmation_cannot_be_logged_nothing_moves(w: World, monkeypatc
     assert w.bank.list_withdrawals(w.checking.id) == []
 
 
+def test_if_the_confirmation_and_the_cancel_both_fail_the_reply_is_consistent(
+    w: World, monkeypatch
+) -> None:
+    """V3-02: the bank was never touched, so the reply says nothing moved (and not
+    "check your balances"); the record stays PENDING and reconcile reports it."""
+    tid = str(w.propose("50").transfer_id)
+    _fail_when(monkeypatch, w.audit, "log_event", lambda _c, kind, **_: kind == "confirmed")
+    _fail_when(monkeypatch, w.audit, "transition", lambda *_a, **_k: True)
+    reply = w.session.on_user_message("yes")
+    assert reply.handled and "Nothing was moved" in str(reply.reply)
+    assert "check your balances" not in str(reply.reply)
+    assert w.session.pending_transfer_id is None
+    monkeypatch.undo()
+    assert w.audit.get(tid).status is S.PENDING
+    assert w.balances() == (1000, 500, -CARD_OWED)
+    w.clock.t += timedelta(minutes=3)
+    report = reconcile(w.bank, w.audit, [w.checking.id, w.savings.id])
+    assert report.count("stale_pending") == 1
+
+
 def test_if_a_retry_cannot_be_logged_nothing_is_left_pending(w: World, monkeypatch) -> None:
     """V2-03: the retry read-back must not be lost while the transfer stays pending
     (a later "yes" would then execute a read-back the user never heard)."""
