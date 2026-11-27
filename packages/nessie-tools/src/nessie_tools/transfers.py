@@ -49,7 +49,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Literal
 
-from nessie_tools.audit import AuditLog, TransferRecord, TransferStatus
+from nessie_tools.audit import AuditLog, TransferRecord, TransferStatus, require_aware_clock
 from nessie_tools.backend import BankBackend
 from nessie_tools.balances import compute_balance
 from nessie_tools.errors import (
@@ -118,6 +118,11 @@ class TransferRejected(LedgerError):
         self.retryable = retryable
 
 
+class TransferExpired(TransferRejected):
+    """execute_pending refused a pending transfer older than `max_age` (D54) and marked
+    it EXPIRED. A subclass so the caller can log the backstop expiry as such (R2-08)."""
+
+
 @dataclass(frozen=True)
 class TransferResult:
     transfer_id: str
@@ -157,7 +162,9 @@ class TransferService:
         max_age: timedelta | None = DEFAULT_MAX_AGE,
     ) -> None:
         """`max_age`: a pending transfer older than this can no longer be executed
-        (D54); None disables the check. `now` must be the same clock the AuditLog uses."""
+        (D54); None disables the check. `now` must be the same clock the AuditLog uses;
+        it must return timezone-aware datetimes (checked here, R2-04)."""
+        require_aware_clock(now, "TransferService")
         self._bank = backend
         self._audit = audit
         self._today = today
@@ -234,7 +241,7 @@ class TransferService:
                 detail=f"expired: pending for {age.total_seconds():.0f}s "
                 f"(limit {self._max_age.total_seconds():.0f}s)",
             )
-            raise TransferRejected("this transfer request has expired; please ask again")
+            raise TransferExpired("this transfer request has expired; please ask again")
 
     # --- the saga ------------------------------------------------------------------
     def _run_legs(self, record: TransferRecord, src: Account, dst: Account) -> TransferResult:

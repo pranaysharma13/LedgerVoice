@@ -117,13 +117,32 @@ class SeedStore:
 
 
 def _write_atomically(path: Path, text: str) -> None:
-    """Write to a temp file, then rename: a crash never leaves half a manifest."""
+    """Write to a temp file, flush it to disk, then rename: a crash never leaves half a
+    manifest, and after a power loss the file is the old or the new version (R2-19)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
     try:
         with os.fdopen(fd, "w") as f:
             f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
+    _fsync_directory(path.parent)
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Make the rename itself durable (POSIX). Not possible on every platform; there
+    the rename is still atomic, just not guaranteed to survive a power loss."""
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)

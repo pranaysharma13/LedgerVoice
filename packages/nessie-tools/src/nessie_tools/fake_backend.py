@@ -72,6 +72,21 @@ class _Store:
     bills: dict[str, list[Bill]] = field(default_factory=lambda: defaultdict(list))
 
 
+# The operations that go through _run, i.e. the only ones fail_next can affect.
+INJECTABLE_OPERATIONS = frozenset(
+    {
+        "create_customer",
+        "create_account",
+        "delete_account",
+        "create_merchant",
+        "create_purchase",
+        "create_withdrawal",
+        "create_deposit",
+        "create_bill",
+    }
+)
+
+
 class FakeBackend:
     def __init__(self, seed: int = 0) -> None:
         # A seeded RNG keeps ids and account numbers identical between runs.
@@ -100,8 +115,11 @@ class FakeBackend:
                          to make all pending late writes land now.
         Calls can be queued: fail_next twice makes the next two calls fail.
         """
-        if not hasattr(self, operation):
-            raise ValueError(f"unknown operation {operation!r}")
+        if operation not in INJECTABLE_OPERATIONS:  # R2-17: never silently ignore
+            raise ValueError(
+                f"can't inject a failure into {operation!r}; only into "
+                f"{', '.join(sorted(INJECTABLE_OPERATIONS))}"
+            )
         if appears_after_lists is not None:
             planned = _PlannedFailure(
                 True, f"injected timeout in {operation} (write lands late)", appears_after_lists

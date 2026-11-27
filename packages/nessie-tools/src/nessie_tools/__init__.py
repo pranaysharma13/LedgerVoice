@@ -52,6 +52,7 @@ from nessie_tools.money import require_whole_dollars
 from nessie_tools.nessie_backend import NessieBackend
 from nessie_tools.reconcile import ReconcileReport, Violation, ViolationKind, reconcile
 from nessie_tools.transfers import (
+    TransferExpired,
     TransferRejected,
     TransferResult,
     TransferService,
@@ -87,6 +88,7 @@ __all__ = [
     "SafetyEvent",
     "TransferEvent",
     "TransferRecord",
+    "TransferExpired",
     "TransferRejected",
     "TransferResult",
     "TransferService",

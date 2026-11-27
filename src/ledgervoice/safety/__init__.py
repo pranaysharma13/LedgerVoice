@@ -6,7 +6,12 @@ for what counts as a yes and amounts.py for amount parsing.
 
 from ledgervoice.safety.amounts import MAX_TRANSFER, AmountRejected, parse_amount
 from ledgervoice.safety.confirm import YES_PHRASES, is_clear_yes
-from ledgervoice.safety.policy import Proposal, ProposalRejected, check_proposal
+from ledgervoice.safety.policy import (
+    Proposal,
+    ProposalRejected,
+    check_card_payment,
+    check_proposal,
+)
 from ledgervoice.safety.session import (
     Event,
     Intercept,
@@ -24,6 +29,7 @@ __all__ = [
     "Proposal",
     "ProposeResult",
     "SafetySession",
+    "check_card_payment",
     "check_proposal",
     "is_clear_yes",
     "parse_amount",

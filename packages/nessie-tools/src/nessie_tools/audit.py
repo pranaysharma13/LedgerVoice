@@ -119,6 +119,13 @@ _MIGRATIONS: list[list[str]] = [
         )""",
         "CREATE INDEX IF NOT EXISTS idx_safety_events_customer ON safety_events (customer_id, id)",
     ],
+    # v4 -> v5: which conversation an event belongs to (eval runs share the seed's
+    # customers) and the transfer's real status after the decision (R2-08)
+    [
+        "ALTER TABLE safety_events ADD COLUMN session_id TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE safety_events ADD COLUMN outcome TEXT NOT NULL DEFAULT ''",
+        "CREATE INDEX IF NOT EXISTS idx_safety_events_session ON safety_events (session_id, id)",
+    ],
 ]
 SCHEMA_VERSION = len(_MIGRATIONS)
 
@@ -146,13 +153,17 @@ class TransferRecord:
 @dataclass(frozen=True)
 class SafetyEvent:
     """One decision of the conversation safety layer (M1d): proposed, confirmed,
-    cancelled, expired, rejected, ... `kind` is defined by the caller."""
+    cancelled, expired, rejected, ... `kind` is defined by the caller. `session_id`
+    names the conversation; `outcome` is the transfer's status after the decision
+    ('' when there is no transfer)."""
 
     customer_id: str
     kind: str
     transfer_id: str | None
     detail: str
     at: str
+    session_id: str = ""
+    outcome: str = ""
 
 
 @dataclass(frozen=True)
@@ -167,6 +178,14 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def require_aware_clock(now: Callable[[], datetime], who: str) -> None:
+    """Refuse a clock without a timezone (R2-04). Ages are computed by subtracting a
+    stored timestamp from `now()`; mixing naive and aware times raises TypeError in
+    the middle of a transfer and strands it as PENDING."""
+    if now().tzinfo is None:
+        raise ValueError(f"{who}: the clock must return timezone-aware datetimes (UTC)")
+
+
 class AuditLog:
     def __init__(self, path: str | Path, now: Callable[[], datetime] = _utc_now) -> None:
         """Open (or create) the audit database. Use ":memory:" in tests."""
@@ -177,6 +196,7 @@ class AuditLog:
         self._conn = sqlite3.connect(str(path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
+        require_aware_clock(now, "AuditLog")
         self._now = now
         with self._lock:
             self._conn.execute("PRAGMA foreign_keys = ON")
@@ -358,7 +378,14 @@ class AuditLog:
         return [self._record(r) for r in rows]
 
     def log_event(
-        self, customer_id: str, kind: str, *, transfer_id: str | None = None, detail: str = ""
+        self,
+        customer_id: str,
+        kind: str,
+        *,
+        transfer_id: str | None = None,
+        detail: str = "",
+        session_id: str = "",
+        outcome: str = "",
     ) -> None:
         """Record a safety decision (D55). Never raises for an unknown transfer id: the
         log must also capture things that never became a transfer."""
@@ -366,21 +393,49 @@ class AuditLog:
             raise AuditError("a safety event needs a kind")
         with self._lock, self._conn:
             self._conn.execute(
-                "INSERT INTO safety_events (at, customer_id, transfer_id, kind, detail)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (self._now().isoformat(), customer_id, transfer_id, kind, detail),
+                "INSERT INTO safety_events"
+                " (at, customer_id, transfer_id, kind, detail, session_id, outcome)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    self._now().isoformat(),
+                    customer_id,
+                    transfer_id,
+                    kind,
+                    detail,
+                    session_id,
+                    outcome,
+                ),
             )
 
-    def safety_events(self, customer_id: str | None = None) -> list[SafetyEvent]:
-        sql = "SELECT customer_id, kind, transfer_id, detail, at FROM safety_events"
-        params: tuple[str, ...] = ()
+    def safety_events(
+        self, customer_id: str | None = None, *, session_id: str | None = None
+    ) -> list[SafetyEvent]:
+        sql = (
+            "SELECT customer_id, kind, transfer_id, detail, at, session_id, outcome"
+            " FROM safety_events"
+        )
+        where: list[str] = []
+        params: list[str] = []
         if customer_id is not None:
-            sql += " WHERE customer_id = ?"
-            params = (customer_id,)
+            where.append("customer_id = ?")
+            params.append(customer_id)
+        if session_id is not None:
+            where.append("session_id = ?")
+            params.append(session_id)
+        if where:
+            sql += " WHERE " + " AND ".join(where)
         with self._lock:
             rows = self._conn.execute(sql + " ORDER BY id", params).fetchall()
         return [
-            SafetyEvent(r["customer_id"], r["kind"], r["transfer_id"], r["detail"], r["at"])
+            SafetyEvent(
+                r["customer_id"],
+                r["kind"],
+                r["transfer_id"],
+                r["detail"],
+                r["at"],
+                r["session_id"],
+                r["outcome"],
+            )
             for r in rows
         ]
 

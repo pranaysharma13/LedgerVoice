@@ -8,7 +8,10 @@ Expected legs per final state (each must be `completed` and must be the exact le
 the audit log recorded):
     COMPLETED    leg 1 withdrawal + leg 2 deposit, no reversal
     COMPENSATED  leg 1 withdrawal + reversal deposit, no leg 2
-    FAILED, PENDING, CANCELLED, EXPIRED   no legs at all
+    FAILED, PENDING, CANCELLED, EXPIRED   no legs at all; a PENDING transfer older
+                                          than `stale_after` is reported as
+                                          stale_pending (R2-04: a crash between "yes"
+                                          and execution must not hide)
     NEEDS_ATTENTION                       always reported (a human must check)
     RESOLVED                              only the legs in the human's snapshot; any
                                           other leg landed later (leg_after_resolution)
@@ -29,8 +32,9 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Literal
 
@@ -39,7 +43,13 @@ from nessie_tools.backend import BankBackend
 from nessie_tools.balances import compute_balance
 from nessie_tools.errors import NotFoundError
 from nessie_tools.models import Account, AccountType, TxStatus
-from nessie_tools.transfers import LEG1_MARKER, LEG2_MARKER, REVERSAL_MARKER, TRANSFER_ID_PREFIX
+from nessie_tools.transfers import (
+    DEFAULT_MAX_AGE,
+    LEG1_MARKER,
+    LEG2_MARKER,
+    REVERSAL_MARKER,
+    TRANSFER_ID_PREFIX,
+)
 
 LegKind = Literal["leg1", "leg2", "reversal", "unknown"]
 
@@ -59,6 +69,7 @@ class ViolationKind(StrEnum):
     LEG_AFTER_RESOLUTION = "leg_after_resolution"  # a leg not in the resolution snapshot
     OVERDRAWN = "overdrawn"  # checking/savings computed balance below $0
     OUT_OF_SCOPE_LEG = "out_of_scope_leg"  # leg here, but its transfer is outside the scope
+    STALE_PENDING = "stale_pending"  # PENDING long after a yes/no should have settled it
 
 
 V = ViolationKind
@@ -130,11 +141,14 @@ def reconcile(
     account_ids: Iterable[str] = (),
     *,
     customer_ids: Iterable[str] | None = None,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    stale_after: timedelta | None = DEFAULT_MAX_AGE,
 ) -> ReconcileReport:
     """Check the audit log against the bank.
 
     Scans `account_ids` plus every account referenced by the in-scope records. Pass
     every account the agent can touch, and the customer ids of the current run.
+    `stale_after=None` turns off the stale_pending check.
     """
     report = ReconcileReport()
     scope = None if customer_ids is None else frozenset(customer_ids)
@@ -191,6 +205,17 @@ def reconcile(
 
     for record in records:
         report.violations.extend(_check_record(record, legs_by_tid.get(record.transfer_id, [])))
+        if stale_after is not None and record.status is TransferStatus.PENDING:
+            age = now() - datetime.fromisoformat(record.created_at)
+            if age > stale_after:
+                report.violations.append(
+                    Violation(
+                        V.STALE_PENDING,
+                        record.transfer_id,
+                        f"pending for {age.total_seconds():.0f}s (limit "
+                        f"{stale_after.total_seconds():.0f}s)",
+                    )
+                )
     return report
 
 

@@ -1,5 +1,6 @@
 import sqlite3
 import threading
+from datetime import datetime
 
 import pytest
 from nessie_tools import AuditError, AuditLog, LedgerError, TransferStatus
@@ -251,7 +252,48 @@ def test_v3_database_upgrades_to_v4_keeping_transfers(tmp_path, monkeypatch):
         make(old)
     monkeypatch.undo()
     with AuditLog(path) as new:
-        assert new.schema_version == SCHEMA_VERSION == 4
+        assert new.schema_version == SCHEMA_VERSION == 5
         assert new.get(TID).status is S.EXECUTING
         new.log_event("cust", "proposed", transfer_id=TID)
         assert len(new.safety_events()) == 1
+
+
+def test_v4_database_upgrades_to_v5_keeping_events(tmp_path, monkeypatch):
+    """R2-08: existing safety events survive and get empty session/outcome."""
+    from nessie_tools import audit as audit_module
+
+    path = tmp_path / "v4.sqlite"
+    monkeypatch.setattr(audit_module, "_MIGRATIONS", audit_module._MIGRATIONS[:4])
+    monkeypatch.setattr(audit_module, "SCHEMA_VERSION", 4)
+    conn_audit = AuditLog(path)
+    conn_audit._conn.execute(
+        "INSERT INTO safety_events (at, customer_id, transfer_id, kind, detail)"
+        " VALUES ('t', 'cust', NULL, 'proposed', 'old')"
+    )
+    conn_audit._conn.commit()
+    conn_audit.close()
+    monkeypatch.undo()
+    with AuditLog(path) as new:
+        assert new.schema_version == 5
+        (old,) = new.safety_events()
+        assert (old.kind, old.detail, old.session_id, old.outcome) == ("proposed", "old", "", "")
+
+
+def test_safety_events_carry_session_and_outcome_and_filter_by_session():
+    with AuditLog(":memory:") as audit:
+        audit.log_event("cust", "proposed", transfer_id=TID, session_id="s1", outcome="PENDING")
+        audit.log_event("cust", "proposed", transfer_id=TID, session_id="s2")
+        audit.log_event("cust", "executed", transfer_id=TID, session_id="s1", outcome="COMPLETED")
+        s1 = audit.safety_events(session_id="s1")
+        assert [(e.kind, e.outcome) for e in s1] == [
+            ("proposed", "PENDING"),
+            ("executed", "COMPLETED"),
+        ]
+        assert len(audit.safety_events("cust", session_id="s2")) == 1
+        assert audit.safety_events("other", session_id="s1") == []
+
+
+def test_audit_log_refuses_a_naive_clock():
+    """R2-04: a naive clock would raise TypeError mid-transfer."""
+    with pytest.raises(ValueError, match="timezone"):
+        AuditLog(":memory:", now=datetime.now)

@@ -137,12 +137,19 @@ def _apply(seed: int, anchor: date, backend: BankBackend, server: str, store: Se
         f"wrote {t.get('writes', 0):.0f} records in {t.get('total_s', 0)} s "
         f"(p50 {t.get('p50_ms')} ms, p95 {t.get('p95_ms')} ms, max {t.get('max_ms')} ms)"
     )
-    return _report(_run_verify(plan_for(manifest), backend, manifest))
+    return _verify_and_report(backend, manifest)
 
 
 def _verify(backend: BankBackend, store: SeedStore) -> int:
-    manifest = _require_manifest(store)
-    return _report(_run_verify(plan_for(manifest), backend, manifest))
+    return _verify_and_report(backend, _require_manifest(store))
+
+
+def _verify_and_report(backend: BankBackend, manifest: Manifest) -> int:
+    try:
+        return _report(_run_verify(plan_for(manifest), backend, manifest))
+    except BankError as exc:  # R2-16: verify collects read errors; this is a backstop
+        print(f"verification could not finish: {exc}", file=sys.stderr)
+        return 1
 
 
 def _reset(backend: BankBackend, server: str, store: SeedStore) -> int:
@@ -169,6 +176,14 @@ def plan_for(manifest: Manifest) -> SeedPlan:
 
 
 def _run_verify(plan: SeedPlan, backend: BankBackend, manifest: Manifest) -> VerifyReport:
+    missing_db = bool(manifest.audit_db) and not Path(manifest.audit_db or "").exists()
+    if missing_db:  # R2-18: opening it would create an empty one that passes reconcile
+        report = verify(plan, backend, manifest, audit=None)
+        report.problems.append(
+            f"the seed's audit database {manifest.audit_db} is missing; reconcile was not "
+            "run (reset and reseed)"
+        )
+        return report
     audit = AuditLog(manifest.audit_db) if manifest.audit_db else None
     try:
         return verify(plan, backend, manifest, audit=audit)

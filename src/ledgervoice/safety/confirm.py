@@ -1,11 +1,14 @@
 """Is this message a clear "yes"? Deterministic, no model involved (D26, D53).
 
-Only a whole message that is one of a fixed list of phrases counts. Normalisation is
-deliberately small: lowercase, curly apostrophes made straight, commas dropped, runs of
-whitespace collapsed, trailing "." and "!" removed. Nothing else is cleaned up, so
-"yes?" (a question), "yes but make it $40", "yesterday", "ok", "sure" and any message
-with hidden or unusual characters are not a yes. Being strict costs little: a
-cancelled transfer moves no money and the user can simply ask again.
+Only a whole message that is one of a fixed list of phrases counts. A message may
+contain only ASCII letters, spaces, tabs, line breaks, straight or curly apostrophes,
+commas, "." and "!"; any other character (control or format characters, non-breaking
+or other Unicode spaces, look-alike letters, digits, "?") means it is not a yes
+(R2-13). Normalisation is deliberately small: lowercase, curly apostrophes made
+straight, commas dropped, runs of spaces/tabs/line breaks collapsed, trailing "." and
+"!" removed. So "yes?" (a question), "yes but make it $40", "yesterday", "ok" and
+"sure" are not a yes. Being strict costs little: a cancelled transfer moves no money
+and the user can simply ask again.
 """
 
 from __future__ import annotations
@@ -40,16 +43,19 @@ YES_PHRASES: frozenset[str] = frozenset(
 )
 MAX_LENGTH = 40  # longer than any phrase above; anything longer is not a plain yes
 
-_WHITESPACE = re.compile(r"\s+")
-_TRAILING = re.compile(r"[.!]+$")
+_ALLOWED = re.compile("[A-Za-z' \t\r\n,.!\u2019]*")  # checked on the raw text
+_SPACES = re.compile("[ \t\r\n]+")
+_TRAILING = re.compile("[.!]+$")
 
 
 def normalize(text: str) -> str:
-    lowered = text.lower().replace("’", "'").replace(",", " ")
-    return _TRAILING.sub("", _WHITESPACE.sub(" ", lowered).strip()).strip()
+    lowered = text.lower().replace("\u2019", "'").replace(",", " ")
+    return _TRAILING.sub("", _SPACES.sub(" ", lowered).strip(" ")).strip(" ")
 
 
-def is_clear_yes(text: str) -> bool:
-    if len(text) > MAX_LENGTH:
+def is_clear_yes(text: object) -> bool:
+    if not isinstance(text, str) or len(text) > MAX_LENGTH:
+        return False
+    if not _ALLOWED.fullmatch(text):
         return False
     return normalize(text) in YES_PHRASES

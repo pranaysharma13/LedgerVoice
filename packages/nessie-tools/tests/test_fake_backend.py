@@ -70,6 +70,14 @@ def test_fail_next_rejects_unknown_operation(fake):
         fake.fail_next("create_transfer")
 
 
+@pytest.mark.parametrize("operation", ["get_account", "list_deposits", "get_customer"])
+def test_fail_next_rejects_operations_it_cannot_fail(fake, operation):
+    """R2-17: reads don't go through the failure queue, so asking for one must not be
+    silently ignored."""
+    with pytest.raises(ValueError, match="can't inject"):
+        fake.fail_next(operation)
+
+
 def test_late_write_lands_after_n_list_calls(fake, account_id):
     fake.fail_next("create_withdrawal", appears_after_lists=1)
     with pytest.raises(BackendFailure) as info:

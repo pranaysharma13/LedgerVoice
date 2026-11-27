@@ -5,7 +5,9 @@ Checked here, in code, before anything is recorded:
   accounts (the model never sees or sends bank ids);
 - source and destination differ;
 - money can be moved into a credit card (a card payment) but never out of one;
-- the amount parses as whole dollars, more than zero, at most $2,000 (amounts.py).
+- the amount parses as whole dollars, at least $1, at most $2,000 (amounts.py);
+- a card payment is at most what the card owes (R2-14; `check_card_payment`, which
+  needs the card's balance, so the session calls it).
 Funds and the accounts' existence are checked again by TransferService.create_pending
 and once more at execution (D34).
 """
@@ -19,7 +21,7 @@ from nessie_tools import Account, AccountType
 
 from ledgervoice.safety.amounts import AmountRejected, parse_amount
 
-_LAST4 = re.compile(r"\d{4}")
+_LAST4 = re.compile(r"[0-9]{4}")  # ASCII digits only (R2-10)
 
 ACCOUNT_WORDS = {
     AccountType.CHECKING: "checking",
@@ -51,7 +53,7 @@ def describe(account: Account) -> str:
 
 
 def check_proposal(
-    accounts: list[Account], from_last4: str, to_last4: str, amount_text: str
+    accounts: list[Account], from_last4: object, to_last4: object, amount_text: object
 ) -> Proposal:
     source = _find(accounts, from_last4, "from")
     destination = _find(accounts, to_last4, "to")
@@ -69,7 +71,23 @@ def check_proposal(
     return Proposal(source, destination, amount)
 
 
-def _find(accounts: list[Account], last4: str, which: str) -> Account:
+def check_card_payment(proposal: Proposal, owed: int) -> None:
+    """A payment into a credit card can't be more than the card owes (D45: amount owed
+    stays a positive number). `owed` is the computed amount owed, in dollars."""
+    if proposal.destination.type is not AccountType.CREDIT_CARD:
+        return
+    card = describe(proposal.destination)
+    if owed <= 0:
+        raise ProposalRejected(f"nothing is owed on the {card}, so there is nothing to pay")
+    if proposal.amount > owed:
+        raise ProposalRejected(
+            f"the {card} only owes ${owed:,}, so the most you can pay into it is ${owed:,}"
+        )
+
+
+def _find(accounts: list[Account], last4: object, which: str) -> Account:
+    if not isinstance(last4, str):  # R2-11: model arguments are checked, never coerced
+        raise ProposalRejected(f"the {which} account must be given as text, like 1234")
     ref = last4.strip()
     if not _LAST4.fullmatch(ref):
         raise ProposalRejected(f"the {which} account must be given as its last 4 digits, like 1234")

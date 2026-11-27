@@ -2,7 +2,10 @@
 
 Order: merchants -> customers -> accounts -> transactions -> bills. Merchants and
 customers are reused from the registry when the bank still has them with the same
-name (and category, for merchants); otherwise new ones are created (D51). Accounts,
+name (and category, for merchants); otherwise new ones are created (D51). A customer
+is reused only if it has no accounts left: an account a timed-out write created is
+never in the manifest, so reset can't delete it, and a customer that still has one
+is abandoned for a new one (R2-06). Accounts,
 transactions and bills are always new: reset deletes the accounts, and Nessie keeps
 their transactions as orphans (D36), so a reseed must never reuse an account.
 
@@ -212,11 +215,14 @@ def _merchant_matches(backend: BankBackend, merchant_id: str, name: str, categor
 
 
 def _customer_matches(backend: BankBackend, customer_id: str, first: str, last: str) -> bool:
+    """Same name, and no accounts left over from an earlier seed (R2-06)."""
     try:
         found = backend.get_customer(customer_id)
     except NotFoundError:
         return False
-    return (found.first_name, found.last_name) == (first, last)
+    if (found.first_name, found.last_name) != (first, last):
+        return False
+    return not backend.list_accounts(customer_id)
 
 
 def _timing(durations: list[float]) -> dict[str, float]:

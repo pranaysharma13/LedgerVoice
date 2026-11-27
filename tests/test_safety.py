@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import random
+import re
+import sqlite3
+import threading
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 
@@ -14,6 +17,7 @@ from nessie_tools import (
     AuditLog,
     FakeBackend,
     NessieError,
+    TransferRejected,
     TransferService,
     TransferStatus,
     compute_balance,
@@ -35,6 +39,7 @@ from ledgervoice.safety.session import Intercept
 
 S = TransferStatus
 TODAY = date(2026, 11, 24)
+CARD_OWED = 300
 ADDRESS = Address(street_number="1", street_name="Test St", city="Town", state="VA", zip="22101")
 
 
@@ -50,6 +55,7 @@ ADDRESS = Address(street_number="1", street_name="Test St", city="Town", state="
         ("1", 1),
         ("007", 7),
         ("$1,999", 1999),
+        ("$ 50", 50),  # one plain space after $ is fine
     ],
 )
 def test_amounts_that_parse(text: str, dollars: int) -> None:
@@ -61,9 +67,13 @@ def test_amounts_that_parse(text: str, dollars: int) -> None:
     [
         ("50.5", "$50 or $51"),
         ("$50.99", "$50 or $51"),
-        ("0.5", "$1 instead"),
-        ("0", "more than zero"),
-        ("0.00", "more than zero"),
+        ("1,000.50", "$1,000 or $1,001"),  # R2-12: with thousands commas
+        ("1999.5", "$1,999 or $2,000"),
+        ("0.5", "smallest amount I can move is $1"),
+        ("0.0000001", "smallest amount"),  # R2-12: no "$1" suggestion for dust
+        ("0", "smallest amount"),
+        ("0.00", "smallest amount"),
+        ("2000.5", "most I can move in one transfer is $2,000"),  # R2-12: never offer $2,001
         ("2001", "$2,000"),
         ("1000000", "$2,000"),
         ("-5", "couldn't read"),
@@ -75,11 +85,33 @@ def test_amounts_that_parse(text: str, dollars: int) -> None:
         ("5O", "couldn't read"),  # letter O, not zero
         ("NaN", "couldn't read"),
         ("50.5.5", "couldn't read"),
+        # R2-10: ASCII digits only, at most one plain space after "$"
+        ("５０", "couldn't read"),
+        ("٥٠", "couldn't read"),
+        ("1٥0", "couldn't read"),
+        ("١,٢٠٠", "couldn't read"),
+        ("$\n50", "couldn't read"),
+        ("$  50", "couldn't read"),
+        ("$\u00a050", "couldn't read"),
+        # R2-09: very long input is refused before any parsing
+        ("1" * 5000 + ".5", "couldn't read"),
+        ("1" * 21, "couldn't read"),
     ],
 )
 def test_amounts_that_are_refused(text: str, says: str) -> None:
-    with pytest.raises(AmountRejected, match=says.replace("$", r"\$")):
+    with pytest.raises(AmountRejected, match=says.replace("$", r"\$")) as info:
         parse_amount(text)
+    # R2-02: never a yes/no question, so a "yes" can't be taken as an answer to it
+    assert not str(info.value).rstrip().endswith("?")
+    assert len(str(info.value)) < 200
+
+
+@pytest.mark.parametrize("value", [50, 50.5, None, True, b"50", ["50"]])
+def test_amounts_that_are_not_text_are_refused_not_converted(value: object) -> None:
+    """R2-11: the model's tool arguments are checked, never coerced (50.5 must not
+    become 50)."""
+    with pytest.raises(AmountRejected, match="as text"):
+        parse_amount(value)
 
 
 # --- what counts as yes ------------------------------------------------------------------
@@ -130,10 +162,26 @@ def test_every_listed_phrase_is_a_yes(phrase: str) -> None:
         "",
         "   ",
         "yes" + " " * 50,  # too long to be a plain yes
+        # R2-13: control, format and Unicode space characters are not folded away
+        "\x1cyes\x1f",
+        "yes\u2028",
+        "yes\u00a0please",
+        "yes\u3000",
+        "\u202eyes",
+        "yes\x00",
+        "yes\u200d",
+        "yes\x0b",
+        "yes\x0c",
+        "\ufeffyes",
     ],
 )
 def test_adversarial_replies_are_not_a_yes(text: str) -> None:
     assert not is_clear_yes(text)
+
+
+@pytest.mark.parametrize("value", [None, 1, True, b"yes", ["yes"]])
+def test_a_reply_that_is_not_text_is_not_a_yes(value: object) -> None:
+    assert not is_clear_yes(value)
 
 
 # --- fixtures for the session ---------------------------------------------------------
@@ -173,7 +221,12 @@ class World:
         )
 
 
-def make_world(*, session_max_age=timedelta(minutes=2), service_max_age=timedelta(minutes=2)):
+def make_world(
+    *,
+    session_max_age=timedelta(minutes=2),
+    service_max_age=timedelta(minutes=2),
+    session_id: str = "s-test",
+):
     clock = Clock()
     bank = FakeBackend(seed=11)
     me = bank.create_customer("Pat", "Safe", ADDRESS)
@@ -181,12 +234,16 @@ def make_world(*, session_max_age=timedelta(minutes=2), service_max_age=timedelt
     checking = bank.create_account(me.id, AccountType.CHECKING, "Checking", 1000)
     savings = bank.create_account(me.id, AccountType.SAVINGS, "Savings", 500)
     card = bank.create_account(me.id, AccountType.CREDIT_CARD, "Card", 0)
+    shop = bank.create_merchant("Shop", "shopping")
+    bank.create_purchase(card.id, shop.id, CARD_OWED, TODAY, "groceries")  # card owes $300
     stranger = bank.create_account(them.id, AccountType.CHECKING, "Theirs", 900)
     audit = AuditLog(":memory:", now=clock)
     service = TransferService(
         bank, audit, today=lambda: TODAY, sleep=lambda _: None, now=clock, max_age=service_max_age
     )
-    session = SafetySession(bank, service, audit, me.id, now=clock, max_age=session_max_age)
+    session = SafetySession(
+        bank, service, audit, me.id, session_id=session_id, now=clock, max_age=session_max_age
+    )
     return World(bank, audit, service, session, clock, checking, savings, card, stranger)
 
 
@@ -225,10 +282,28 @@ def test_policy_refusals(w: World, src: str, dst: str, says: str) -> None:
 
 
 def test_paying_into_the_card_is_allowed(w: World) -> None:
+    assert w.balances() == (1000, 500, -CARD_OWED)
     result = w.propose("200", dst=w.card)
     assert result.ok and "to credit card ending in" in result.say
     assert w.session.on_user_message("yes").handled
-    assert w.balances() == (800, 500, 200)
+    assert w.balances() == (800, 500, -100)
+
+
+def test_a_card_payment_can_be_exactly_what_is_owed(w: World) -> None:
+    assert w.propose(str(CARD_OWED), dst=w.card).ok
+    assert w.session.on_user_message("yes").handled
+    assert w.balances() == (700, 500, 0)
+
+
+def test_paying_more_than_the_card_owes_is_refused(w: World) -> None:
+    """R2-14: the amount owed stays a positive number (D45)."""
+    result = w.propose(str(CARD_OWED + 1), dst=w.card)
+    assert not result.ok and "only owes $300" in result.say
+    assert w.audit.records() == []
+    w.propose(str(CARD_OWED), dst=w.card)
+    w.session.on_user_message("yes")
+    result = w.propose("1", dst=w.card)
+    assert not result.ok and "nothing is owed" in result.say
 
 
 def test_policy_refuses_ambiguous_last_digits(w: World) -> None:
@@ -245,10 +320,10 @@ def test_propose_then_yes_moves_the_money(w: World) -> None:
         f"You're moving $50 from checking ending in {w.checking.last4} to savings ending in "
         f"{w.savings.last4}. Say yes to confirm, or anything else to cancel."
     )
-    assert w.balances() == (1000, 500, 0)  # proposing moves nothing
+    assert w.balances() == (1000, 500, -CARD_OWED)  # proposing moves nothing
     reply = w.session.on_user_message("Yes, please!")
     assert reply.handled and reply.reply and "50" in reply.reply
-    assert w.balances() == (950, 550, 0)
+    assert w.balances() == (950, 550, -CARD_OWED)
     assert w.audit.get(result.transfer_id).status is S.COMPLETED
     assert w.events() == ["proposed", "confirmed", "executed"]
     assert w.session.pending_transfer_id is None
@@ -259,7 +334,7 @@ def test_anything_but_yes_cancels_and_goes_to_the_model(w: World) -> None:
     reply = w.session.on_user_message("hmm, make it 40 instead")
     assert not reply.handled and reply.note and "cancelled" in reply.note
     assert w.audit.get(str(tid)).status is S.CANCELLED
-    assert w.balances() == (1000, 500, 0)
+    assert w.balances() == (1000, 500, -CARD_OWED)
     assert w.events() == ["proposed", "cancelled_not_a_yes"]
 
 
@@ -268,7 +343,7 @@ def test_a_late_yes_after_a_no_does_nothing(w: World) -> None:
     w.propose("50")
     w.session.on_user_message("wait")
     assert w.session.on_user_message("yes") == Intercept(handled=False)
-    assert w.balances() == (1000, 500, 0)
+    assert w.balances() == (1000, 500, -CARD_OWED)
 
 
 def test_yes_without_a_pending_transfer_is_an_ordinary_message(w: World) -> None:
@@ -290,7 +365,7 @@ def test_a_yes_after_two_minutes_does_not_move_money(w: World) -> None:
     reply = w.session.on_user_message("yes")
     assert not reply.handled and reply.note and "expired" in reply.note
     assert w.audit.get(str(tid)).status is S.EXPIRED
-    assert w.balances() == (1000, 500, 0)
+    assert w.balances() == (1000, 500, -CARD_OWED)
     assert w.events() == ["proposed", "expired"]
 
 
@@ -313,18 +388,37 @@ def test_nessie_tools_refuses_a_stale_yes_even_if_the_session_would_allow_it() -
     reply = w.session.on_user_message("yes")
     assert reply.handled and reply.reply and "Nothing was moved" in reply.reply
     assert w.audit.get(str(tid)).status is S.EXPIRED
-    assert w.balances() == (1000, 500, 0)
+    assert w.balances() == (1000, 500, -CARD_OWED)
+    # R2-08: logged as the backstop expiry it is, not as a generic refusal
+    assert w.events() == ["proposed", "confirmed", "expired_at_execution"]
+    assert w.audit.safety_events()[-1].outcome == "EXPIRED"
 
 
 # --- replacing and refusing ---------------------------------------------------------------
-def test_a_new_proposal_replaces_the_pending_one(w: World) -> None:
+def test_a_second_proposal_while_one_is_pending_cancels_both(w: World) -> None:
+    """R2-01: two proposals in one model turn. The user can't know which read-back they
+    heard, so nothing may be left that a "yes" could execute."""
+    first = w.propose("50")
+    second = w.propose("700", dst=w.card)
+    assert first.ok and not second.ok and second.transfer_id is None
+    assert "Two transfers" in second.say and "nothing was moved" in second.say
+    assert w.audit.get(str(first.transfer_id)).status is S.CANCELLED
+    assert len(w.audit.records()) == 1  # the second was never recorded
+    assert w.session.pending_transfer_id is None
+    assert w.session.on_user_message("yes") == Intercept(handled=False)
+    assert w.balances() == (1000, 500, -CARD_OWED)
+    assert w.events() == ["proposed", "cancelled_second_proposal", "proposal_refused"]
+
+
+def test_changing_your_mind_in_a_reply_still_works(w: World) -> None:
+    """The user's "make it $60" settles the first proposal; the model then proposes
+    again in a new turn (D53, E as agreed)."""
     first = w.propose("50").transfer_id
-    second = w.propose("70").transfer_id
-    assert first != second and w.session.pending_transfer_id == second
-    assert w.audit.get(str(first)).status is S.CANCELLED
+    assert not w.session.on_user_message("actually make it 60").handled
+    second = w.propose("60")
+    assert second.ok and w.audit.get(str(first)).status is S.CANCELLED
     assert w.session.on_user_message("yes").handled
-    assert w.balances() == (930, 570, 0)  # only the second one ran
-    assert w.events() == ["proposed", "replaced", "proposed", "confirmed", "executed"]
+    assert w.balances() == (940, 560, -CARD_OWED)
 
 
 def test_a_refused_proposal_leaves_nothing_pending(w: World) -> None:
@@ -342,12 +436,49 @@ def test_insufficient_funds_is_refused_before_anything_is_recorded(w: World) -> 
     assert w.audit.records() == []
 
 
-def test_a_refused_new_proposal_still_keeps_the_old_one_pending(w: World) -> None:
-    """A bad follow-up request must not silently cancel a good pending one; but the
-    user's next message settles the old one as usual."""
+@pytest.mark.parametrize(
+    ("second", "dst_name"),
+    [("3000", "savings"), ("50.5", "savings"), ("1500", "savings"), ("abc", "savings")],
+)
+def test_any_second_proposal_leaves_nothing_a_yes_could_confirm(
+    w: World, second: str, dst_name: str
+) -> None:
+    """R2-02: whichever check the second proposal fails (policy, amount, funds), the
+    result is the same: both are gone, and a "yes" (e.g. to "$50 or $51") moves nothing."""
     tid = w.propose("50").transfer_id
-    assert not w.propose("abc").ok
-    assert w.session.pending_transfer_id == tid
+    result = w.propose(second, dst=getattr(w, dst_name))
+    assert not result.ok
+    assert w.session.pending_transfer_id is None
+    assert w.audit.get(str(tid)).status is S.CANCELLED
+    assert w.session.on_user_message("yes") == Intercept(handled=False)
+    assert w.balances() == (1000, 500, -CARD_OWED)
+
+
+def test_refusal_messages_end_cleanly(w: World) -> None:
+    """R2-12: no "?." when the reason already ends in punctuation."""
+    for amount in ("50.5", "2500", "abc"):
+        say = w.propose(amount).say
+        assert "?." not in say and say.endswith(".") and not say.endswith(".."), say
+
+
+@pytest.mark.parametrize(
+    ("src", "dst", "amount"),
+    [(1234, "0000", "50"), ("0000", None, "50"), ("0000", "0000", 50), ("0000", "0000", 50.5)],
+)
+def test_proposals_with_arguments_that_are_not_text_are_refused(w, src, dst, amount) -> None:
+    """R2-11: tool arguments come from the model; anything that isn't text is refused."""
+    result = w.session.propose(src, dst, amount)
+    assert not result.ok and "as text" in result.say
+    assert w.audit.records() == []
+
+
+def test_policy_refuses_last_digits_that_are_not_ascii_or_text(w: World) -> None:
+    accounts = w.bank.list_accounts(w.session.customer_id)
+    arabic = w.checking.last4.translate(str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩"))
+    with pytest.raises(ProposalRejected, match="last 4 digits"):
+        check_proposal(accounts, arabic, w.savings.last4, "5")
+    with pytest.raises(ProposalRejected, match="as text"):
+        check_proposal(accounts, int(w.checking.last4), w.savings.last4, "5")
 
 
 # --- failures at execution (D39) ------------------------------------------------------
@@ -372,7 +503,7 @@ def test_a_temporary_failure_asks_again_and_a_fresh_yes_completes(w: World, monk
     assert "Say yes to confirm" in reply.reply
     assert w.session.pending_transfer_id == tid
     assert w.session.on_user_message("yes").handled
-    assert w.balances() == (950, 550, 0)
+    assert w.balances() == (950, 550, -CARD_OWED)
     assert w.events() == ["proposed", "confirmed", "retry_offered", "confirmed", "executed"]
 
 
@@ -382,7 +513,7 @@ def test_a_retry_needs_a_real_yes_too(w: World, monkeypatch) -> None:
     w.session.on_user_message("yes")
     assert not w.session.on_user_message("never mind").handled
     assert w.audit.get(str(tid)).status is S.CANCELLED
-    assert w.balances() == (1000, 500, 0)
+    assert w.balances() == (1000, 500, -CARD_OWED)
 
 
 def test_retries_are_limited_and_then_cancelled(w: World, monkeypatch) -> None:
@@ -416,65 +547,221 @@ def test_a_permanent_failure_at_execution_moves_nothing(w: World) -> None:
     assert compute_balance(w.bank, w.checking.id).current == 1000
 
 
-# --- the guarantee, at scale -----------------------------------------------------------
-def _twisted_messages(rng: random.Random, n: int) -> list[str]:
-    """Messages built to look like a yes without being one, plus random noise."""
-    base = sorted(YES_PHRASES) + ["yes"] * 10
-    extras = [
-        "but",
-        "and",
-        "no",
-        "wait",
-        "?",
-        "send 500",
-        "to savings",
-        "instead",
-        "maybe",
-        "not",
-        "ignore that",
-        "$40",
-        "later",
-        "x",
-        "​",
-        "е",
-        "please?",
+# --- unexpected errors never strand a transfer or misreport it (R2-03..R2-05) ----------
+def _fail_when(monkeypatch, obj, name, should_fail):
+    real = getattr(obj, name)
+
+    def wrapper(*args, **kwargs):
+        if should_fail(*args, **kwargs):
+            raise sqlite3.OperationalError("disk I/O error")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(obj, name, wrapper)
+
+
+def test_if_the_proposal_cannot_be_logged_nothing_waits_for_a_yes(w: World, monkeypatch) -> None:
+    """R2-03: the read-back is never returned, so the transfer must not stay pending."""
+    _fail_when(monkeypatch, w.audit, "log_event", lambda _c, kind, **_: kind == "proposed")
+    with pytest.raises(sqlite3.OperationalError):
+        w.propose("50")
+    assert w.session.pending_transfer_id is None
+    (record,) = w.audit.records()
+    assert record.status is S.CANCELLED
+    assert w.session.on_user_message("yes") == Intercept(handled=False)
+    assert w.balances() == (1000, 500, -CARD_OWED)
+
+
+def test_an_error_before_any_money_moves_cancels_and_says_so(w: World, monkeypatch) -> None:
+    """R2-04: the audit log fails as execution starts; the transfer is cancelled, not
+    left PENDING, and the event log says what happened."""
+    tid = w.propose("50").transfer_id
+    _fail_when(monkeypatch, w.audit, "transition", lambda _t, status, **_: status is S.EXECUTING)
+    reply = w.session.on_user_message("yes")
+    assert reply.handled and "Nothing was moved" in str(reply.reply)
+    assert w.audit.get(str(tid)).status is S.CANCELLED
+    assert w.balances() == (1000, 500, -CARD_OWED)
+    last = w.audit.safety_events()[-1]
+    assert (last.kind, last.outcome) == ("execution_error", "CANCELLED")
+    assert "OperationalError" in last.detail
+
+
+def test_an_error_after_money_moved_never_claims_nothing_moved(w: World, monkeypatch) -> None:
+    """R2-04: leg 1 is written, then the audit log fails. The user must not be told
+    nothing moved; reconcile reports the stuck transfer."""
+    tid = w.propose("50").transfer_id
+    _fail_when(monkeypatch, w.audit, "transition", lambda _t, status, **_: status is S.LEG1_DONE)
+    reply = w.session.on_user_message("yes")
+    assert reply.handled and "Nothing was moved" not in str(reply.reply)
+    assert "check your balances" in str(reply.reply)
+    assert w.audit.get(str(tid)).status is S.EXECUTING
+    assert w.audit.safety_events()[-1].outcome == "EXECUTING"
+    monkeypatch.undo()
+    report = reconcile(w.bank, w.audit, [w.checking.id, w.savings.id], now=w.clock)
+    assert report.count("stuck_in_progress") == 1
+
+
+def test_a_cancel_that_finds_the_money_already_moved_does_not_say_nothing_moved(
+    w: World,
+) -> None:
+    """R2-05: something else (another runtime, a bug) executed the transfer; the user's
+    "no" must not produce "Nothing was moved"."""
+    tid = str(w.propose("50").transfer_id)
+    w.service.execute_pending(tid, customer_id=w.session.customer_id)
+    reply = w.session.on_user_message("no thanks")
+    assert not reply.handled and reply.note
+    assert "Nothing was moved" not in reply.note and "COMPLETED" in reply.note
+    kinds = [(e.kind, e.outcome) for e in w.audit.safety_events()]
+    assert kinds[-2:] == [("state_mismatch", "COMPLETED"), ("cancelled_not_a_yes", "COMPLETED")]
+
+
+def test_a_proposal_during_a_slow_execution_waits_for_it(w: World, monkeypatch) -> None:
+    """R2-05: the session's methods are serialized. Without the lock, a proposal made
+    while a retry was being decided could be overwritten and left PENDING forever."""
+    tid = w.propose("50").transfer_id
+    entered, release = threading.Event(), threading.Event()
+
+    def slow_temporary_failure(transfer_id, *, customer_id):
+        entered.set()
+        assert release.wait(5)
+        raise TransferRejected("bank busy", retryable=True)
+
+    monkeypatch.setattr(w.service, "execute_pending", slow_temporary_failure)
+    answer = threading.Thread(target=w.session.on_user_message, args=("yes",))
+    answer.start()
+    assert entered.wait(5)
+    other = threading.Thread(target=w.propose, args=("20",))
+    other.start()
+    other.join(0.3)  # with the lock it is still waiting here
+    release.set()
+    answer.join(5)
+    other.join(5)
+    stranded = [
+        r.transfer_id
+        for r in w.audit.records()
+        if r.status is S.PENDING and r.transfer_id != w.session.pending_transfer_id
     ]
+    assert stranded == []
+    assert w.audit.get(str(tid)).status is S.CANCELLED  # the 2nd proposal cancelled both
+    assert w.session.pending_transfer_id is None
+
+
+# --- the event log (D55, R2-08) -----------------------------------------------------------
+def test_events_carry_the_session_and_the_real_outcome(w: World) -> None:
+    w.propose("50")
+    w.session.on_user_message("yes")
+    events = w.audit.safety_events(session_id="s-test")
+    assert [(e.kind, e.outcome) for e in events] == [
+        ("proposed", "PENDING"),
+        ("confirmed", "PENDING"),
+        ("executed", "COMPLETED"),
+    ]
+
+
+def test_an_executed_event_says_how_execution_ended(w: World) -> None:
+    """A compensated transfer is still logged as executed, with its real status."""
+    w.propose("50")
+    w.bank.fail_next("create_deposit")  # leg 2 rejected -> leg 1 returned
+    reply = w.session.on_user_message("yes")
+    assert reply.handled
+    last = w.audit.safety_events()[-1]
+    assert (last.kind, last.outcome) == ("executed", "COMPENSATED")
+    assert w.balances() == (1000, 500, -CARD_OWED)
+
+
+def test_two_sessions_for_one_customer_are_told_apart(w: World) -> None:
+    """Eval runs share the seed's customers; the session id keeps their events apart."""
+    other = SafetySession(
+        w.bank, w.service, w.audit, w.session.customer_id, session_id="s-other", now=w.clock
+    )
+    w.propose("5")
+    other.propose(w.checking.last4, w.savings.last4, "7")
+    assert len(w.audit.safety_events(session_id="s-test")) == 1
+    assert len(w.audit.safety_events(session_id="s-other")) == 1
+    assert SafetySession(w.bank, w.service, w.audit, "c").session_id.startswith("sess-")
+
+
+# --- the guarantee, at scale -----------------------------------------------------------
+# Every generated message contains at least one of these. None of them can appear in a
+# plain yes (checked below), so each message is known NOT to be a yes by construction;
+# the classifier under test is never used to decide that (R2-07).
+POISON_WORDS = (
+    "but no not wait instead maybe later send more to savings ignore actually cancel "
+    "never stop hold and then also twice again"
+).split()
+POISON_CHARS = [
+    "?", "0", "5", "$", "-", ":", ";", '"', "\u200b", "\u200d", "\u00a0", "\u2028",
+    "\u3000", "\x1c", "\x1f", "\x0b", "\ufeff", "\u202e", "\u0435", "\uff59",
+]  # fmt: skip
+HOMOGLYPHS = {"e": "\u0435", "o": "\u043e", "a": "\u0430", "i": "\u0456", "y": "\u0443"}
+_WORD = re.compile("[a-z]+")
+
+
+def _is_poisoned(msg: str) -> bool:
+    """The independent oracle: True if the message holds a word or character that no
+    plain yes can contain."""
+    return any(c in msg for c in POISON_CHARS + list(HOMOGLYPHS.values())) or any(
+        w in POISON_WORDS for w in _WORD.findall(msg.lower())
+    )
+
+
+def test_no_yes_phrase_contains_a_poison_word_or_character() -> None:
+    """Keeps the oracle honest if YES_PHRASES ever changes."""
+    for phrase in YES_PHRASES:
+        assert not _is_poisoned(phrase), phrase
+
+
+def _near_miss_messages(rng: random.Random, n: int) -> list[str]:
+    """Messages built to look like a yes without being one."""
+    phrases = sorted(YES_PHRASES) + ["yes"] * 10
+    seps = [" ", ", ", "  ", "\n", ""]
     out: list[str] = []
     while len(out) < n:
-        phrase = rng.choice(base)
+        phrase = rng.choice(phrases)
+        if rng.random() < 0.5:
+            phrase = rng.choice([phrase, phrase.upper(), phrase.capitalize()])
         roll = rng.random()
-        if roll < 0.25:
-            msg = f"{phrase} {rng.choice(extras)}"
+        if roll < 0.3:  # the "yes, but ..." family, which a prefix check would accept
+            tail = " ".join(rng.sample(POISON_WORDS, rng.randint(1, 3)))
+            msg = phrase + rng.choice(seps[:4]) + tail + rng.choice(["", ".", "!", " 500"])
         elif roll < 0.45:
-            msg = f"{rng.choice(extras)} {phrase}"
-        elif roll < 0.6:
+            msg = rng.choice(POISON_WORDS) + rng.choice(seps[:4]) + phrase
+        elif roll < 0.75:  # one odd character anywhere, including at either end
             i = rng.randrange(len(phrase) + 1)
-            msg = phrase[:i] + rng.choice("abcxyz?0 ​") + phrase[i:]
-        elif roll < 0.7:
-            msg = phrase + "?"
-        elif roll < 0.8:
-            msg = phrase.replace("e", "е")
-        elif roll < 0.9:
-            msg = "".join(rng.choice("yesnoak ?!.,") for _ in range(rng.randint(0, 12)))
-        else:
-            msg = phrase[: max(1, len(phrase) - 1)]
-        if not is_clear_yes(msg):
-            out.append(msg)
+            msg = phrase[:i] + rng.choice(POISON_CHARS) + phrase[i:]
+        elif roll < 0.9:  # a look-alike letter
+            letters = [i for i, c in enumerate(phrase.lower()) if c in HOMOGLYPHS]
+            if not letters:
+                continue
+            i = rng.choice(letters)
+            msg = phrase[:i] + HOMOGLYPHS[phrase[i].lower()] + phrase[i + 1 :]
+        else:  # noise that still holds a poison character
+            noise = "".join(rng.choice("yesnoak .,!") for _ in range(rng.randint(0, 8)))
+            msg = noise + rng.choice(POISON_CHARS)
+        assert _is_poisoned(msg), repr(msg)  # the generator can't produce a real yes
+        out.append(msg)
     return out
 
 
-def test_no_message_that_is_not_a_clear_yes_ever_moves_money() -> None:
-    """DoD: thousands of near-miss replies; every one cancels, none executes."""
+def test_the_classifier_rejects_every_near_miss() -> None:
+    """R2-07: asserts on the classifier itself. A "starts with yes" checker, or one
+    that folds Unicode spaces away, fails here."""
+    messages = _near_miss_messages(random.Random(20261127), 5000)
+    assert len(set(messages)) > 2000  # genuinely varied
+    accepted = [m for m in messages if is_clear_yes(m)]
+    assert accepted == []
+
+
+def test_no_near_miss_reply_ever_moves_money() -> None:
+    """DoD: thousands of near-miss replies through the session; every one cancels,
+    none executes, and reconcile is clean."""
     w = make_world()
-    rng = random.Random(20261124)
-    messages = _twisted_messages(rng, 3000)
-    assert len(set(messages)) > 1000  # genuinely varied
+    messages = _near_miss_messages(random.Random(20261124), 3000)
     for msg in messages:
         tid = w.propose("5").transfer_id
         reply = w.session.on_user_message(msg)
-        assert not reply.handled, msg
-        assert w.audit.get(str(tid)).status is S.CANCELLED, msg
-    assert w.balances() == (1000, 500, 0)
+        assert not reply.handled, repr(msg)
+        assert w.audit.get(str(tid)).status is S.CANCELLED, repr(msg)
+    assert w.balances() == (1000, 500, -CARD_OWED)
     assert all(r.status is S.CANCELLED for r in w.audit.records())
     assert w.bank.list_withdrawals(w.checking.id) == []
     report = reconcile(w.bank, w.audit, [w.checking.id, w.savings.id, w.card.id])
@@ -492,7 +779,7 @@ def test_mixed_conversation_reconciles_cleanly(w: World, monkeypatch) -> None:
     w.session.on_user_message("yes")  # expired
     w.propose("10", dst=w.card)
     w.session.on_user_message("go ahead")  # card payment
-    assert w.balances() == (940, 550, 10)
+    assert w.balances() == (940, 550, -CARD_OWED + 10)
     accounts = [w.checking.id, w.savings.id, w.card.id]
     assert reconcile(w.bank, w.audit, accounts).ok
     executed = [e for e in w.audit.safety_events() if e.kind == Event.EXECUTED]

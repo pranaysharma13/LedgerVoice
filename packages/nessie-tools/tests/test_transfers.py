@@ -9,6 +9,7 @@ from nessie_tools import (
     AuditLog,
     NessieDataError,
     NessieError,
+    TransferExpired,
     TransferRejected,
     TransferService,
     TransferStatus,
@@ -628,8 +629,9 @@ def test_a_stale_proposal_expires_instead_of_executing(bank):
     """D54: even if the runtime forgot to expire it, nessie-tools refuses a stale yes."""
     clock, audit, service, pending = _timed_service(bank)
     clock.t += timedelta(minutes=2, seconds=1)
-    with pytest.raises(TransferRejected, match="expired") as info:
+    with pytest.raises(TransferExpired, match="expired") as info:
         service.execute_pending(pending.transfer_id, customer_id=bank.customer_id)
+    assert isinstance(info.value, TransferRejected)  # callers catching the base still work
     assert not info.value.retryable
     assert audit.get(pending.transfer_id).status is S.EXPIRED
     assert "expired" in audit.events(pending.transfer_id)[-1].detail
@@ -640,3 +642,10 @@ def test_max_age_none_disables_the_check(bank):
     clock, audit, service, pending = _timed_service(bank, max_age=None)
     clock.t += timedelta(hours=5)
     assert service.execute_pending(pending.transfer_id, customer_id=bank.customer_id).succeeded
+
+
+def test_transfer_service_refuses_a_naive_clock(bank):
+    """R2-04: a clock without a timezone would raise TypeError in the age check and
+    strand the transfer as PENDING."""
+    with pytest.raises(ValueError, match="timezone"):
+        TransferService(bank.fake, bank.audit, now=datetime.now)

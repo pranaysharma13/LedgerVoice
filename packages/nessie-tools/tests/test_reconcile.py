@@ -1,6 +1,6 @@
 """Reconciliation catches every way the audit log and the bank can disagree."""
 
-from datetime import date
+from datetime import date, datetime, timedelta
 
 import pytest
 from nessie_tools import TransferStatus, TxStatus, ViolationKind, reconcile
@@ -226,3 +226,18 @@ def test_count_accepts_plain_strings(bank):
     assert report.count(V.UNAUDITED_LEG) == 1
     with pytest.raises(ValueError):
         report.count("unaudited_legs")
+
+
+def test_a_stale_pending_transfer_is_reported(bank):
+    """R2-04: a transfer left PENDING (e.g. a crash between "yes" and execution) must
+    not hide; it is reported once it is older than the confirmation window."""
+    pending = bank.service.create_pending(bank.customer_id, bank.checking.id, bank.savings.id, 5)
+    created = datetime.fromisoformat(bank.audit.get(pending.transfer_id).created_at)
+    fresh = run(bank, now=lambda: created + timedelta(seconds=119))
+    assert fresh.ok
+    stale = run(bank, now=lambda: created + timedelta(minutes=3))
+    assert stale.count(V.STALE_PENDING) == 1
+    assert stale.violations[0].transfer_id == pending.transfer_id
+    assert run(bank, now=lambda: created + timedelta(hours=1), stale_after=None).ok
+    bank.service.cancel_pending(pending.transfer_id, customer_id=bank.customer_id)
+    assert run(bank, now=lambda: created + timedelta(hours=1)).ok  # settled: not reported

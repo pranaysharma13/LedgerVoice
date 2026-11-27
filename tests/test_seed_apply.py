@@ -262,9 +262,75 @@ def test_verify_does_not_retry_a_permanent_error(small: SeedPlan, monkeypatch) -
 
     monkeypatch.setattr(bank, "list_bills", unauthorized)
     sleeps: list[float] = []
-    with pytest.raises(NessieError):
-        verify(small, bank, manifest, sleep=sleeps.append)
+    report = verify(small, bank, manifest, sleep=sleeps.append)
     assert sleeps == []
+    # R2-16: recorded as a problem for every account, not a crash; the other
+    # accounts' checks still ran (D51: collect all problems)
+    failed = [p for p in report.problems if "a read failed" in p]
+    assert len(failed) == len(small.accounts)
+    assert report.checked["accounts"] == len(small.accounts)
+
+
+def test_verify_records_a_bad_record_as_a_problem(small: SeedPlan, monkeypatch) -> None:
+    """R2-16: malformed bank data (NessieDataError) is reported, not a traceback."""
+    from nessie_tools import NessieDataError
+
+    bank, manifest = seed_fake(small)
+
+    def garbled(customer_id):
+        raise NessieDataError("expected a list")
+
+    monkeypatch.setattr(bank, "list_accounts", garbled)
+    report = verify(small, bank, manifest)
+    assert not report.ok
+    assert any("could not be read" in p and "expected a list" in p for p in report.problems)
+
+
+def test_verify_reports_an_account_the_manifest_does_not_list(small: SeedPlan) -> None:
+    """R2-06: an extra account under a seed customer (e.g. created by a write that timed
+    out, so it never reached the manifest) is a problem."""
+    bank, manifest = seed_fake(small)
+    stray = bank.create_account(manifest.customers["priya"], AccountType.SAVINGS, "Savings", 1200)
+    report = verify(small, bank, manifest)
+    assert [p for p in report.problems if "not part of this seed" in p] == [
+        f"customer priya: account {stray.id} is not part of this seed (R2-06)"
+    ]
+
+
+def test_a_timed_out_account_create_never_leaves_a_hidden_account(small: SeedPlan) -> None:
+    """R2-06 end to end: the create times out after the bank wrote the account. Reset
+    can't see it, but the reseed won't reuse that customer, so the agent never sees a
+    stray account, and verify stays honest."""
+    bank, registry = FakeBackend(seed=1), Registry()
+    saved: list[Manifest] = []
+    real, calls = bank.create_account, {"n": 0}
+
+    def times_out_on_the_second(*args, **kwargs):
+        calls["n"] += 1
+        created = real(*args, **kwargs)
+        if calls["n"] == 2:
+            raise BackendFailure("timeout after writing", ambiguous=True)
+        return created
+
+    bank.create_account = times_out_on_the_second  # type: ignore[method-assign]
+    with pytest.raises(BackendFailure):
+        apply_plan(
+            small,
+            bank,
+            server="fake",
+            registry=registry,
+            save=lambda m: saved.append(Manifest.from_json(m.to_json())),
+        )
+    aborted = saved[-1]
+    assert len(aborted.accounts) == 1  # the timed-out account is not listed
+    assert reset(bank, aborted, server="fake") == []
+    old_customer = aborted.customers["priya"]
+    assert len(bank.list_accounts(old_customer)) == 1  # the stray one survived reset
+    bank.create_account = real  # type: ignore[method-assign]
+    again = apply_plan(small, bank, server="fake", registry=registry)
+    assert again.customers["priya"] != old_customer  # not reused
+    assert len(bank.list_accounts(again.customers["priya"])) == len(small.accounts)
+    assert verify(small, bank, again).ok
 
 
 # --- reuse of merchants and customers (D51) ---------------------------------------------
@@ -307,6 +373,30 @@ def test_manifest_round_trips_and_writes_atomically(small: SeedPlan, tmp_path: P
     loaded = store.load_manifest()
     assert loaded == manifest
     assert [p.name for p in tmp_path.iterdir()] == ["manifest.json"]  # no temp files left
+
+
+def test_manifest_writes_are_flushed_to_disk(small: SeedPlan, tmp_path: Path, monkeypatch) -> None:
+    """R2-19: the new file's data is fsynced BEFORE the rename (and the directory after),
+    so a power loss leaves the old or the new manifest, never an empty one."""
+    import os
+    import stat
+
+    steps: list[str] = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def recording_fsync(fd: int) -> None:
+        steps.append("fsync file" if stat.S_ISREG(os.fstat(fd).st_mode) else "fsync dir")
+        real_fsync(fd)
+
+    def recording_replace(src, dst) -> None:
+        steps.append("rename")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "fsync", recording_fsync)
+    monkeypatch.setattr(os, "replace", recording_replace)
+    _, manifest = seed_fake(small)
+    SeedStore(tmp_path).save_manifest(manifest)
+    assert steps[:2] == ["fsync file", "rename"]
 
 
 def test_manifest_with_an_unknown_schema_is_refused(small: SeedPlan) -> None:
@@ -398,3 +488,22 @@ def _address():
     from ledgervoice.seed.apply import SEED_ADDRESS
 
     return SEED_ADDRESS
+
+
+def test_cli_verify_reports_a_missing_audit_database(tmp_path: Path, capsys) -> None:
+    """R2-18: a missing audit DB must not be silently re-created empty (which would
+    pass reconcile)."""
+    bank = FakeBackend(seed=1)
+
+    def factory():
+        return bank, "fake", lambda: None
+
+    args = ["--dir", str(tmp_path)]
+    assert seed_cli(["apply", "--anchor", ANCHOR.isoformat(), *args], factory) == 0
+    manifest = SeedStore(tmp_path).load_manifest()
+    assert manifest is not None and manifest.audit_db
+    Path(manifest.audit_db).unlink()
+    capsys.readouterr()
+    assert seed_cli(["verify", *args], factory) == 1
+    assert "audit database" in capsys.readouterr().out
+    assert not Path(manifest.audit_db).exists()  # not re-created
