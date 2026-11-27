@@ -6,10 +6,9 @@ Checked here, in code, before anything is recorded:
 - source and destination differ;
 - money can be moved into a credit card (a card payment) but never out of one;
 - the amount parses as whole dollars, at least $1, at most $2,000 (amounts.py);
-- a card payment is at most what the card owes (R2-14; `check_card_payment`, which
-  needs the card's balance, so the session calls it).
-Funds and the accounts' existence are checked again by TransferService.create_pending
-and once more at execution (D34).
+Funds, the accounts' existence and the card cap (a payment into a card is at most
+what it owes, D57) are checked by TransferService.create_pending and again at
+execution (D34, V2-05).
 """
 
 from __future__ import annotations
@@ -69,20 +68,6 @@ def check_proposal(
     except AmountRejected as exc:
         raise ProposalRejected(str(exc)) from None
     return Proposal(source, destination, amount)
-
-
-def check_card_payment(proposal: Proposal, owed: int) -> None:
-    """A payment into a credit card can't be more than the card owes (D45: amount owed
-    stays a positive number). `owed` is the computed amount owed, in dollars."""
-    if proposal.destination.type is not AccountType.CREDIT_CARD:
-        return
-    card = describe(proposal.destination)
-    if owed <= 0:
-        raise ProposalRejected(f"nothing is owed on the {card}, so there is nothing to pay")
-    if proposal.amount > owed:
-        raise ProposalRejected(
-            f"the {card} only owes ${owed:,}, so the most you can pay into it is ${owed:,}"
-        )
 
 
 def _find(accounts: list[Account], last4: object, which: str) -> Account:

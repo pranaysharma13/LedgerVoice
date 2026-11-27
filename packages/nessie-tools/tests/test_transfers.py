@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from conftest import TODAY
 from nessie_tools import (
+    AccountType,
     AuditLog,
     NessieDataError,
     NessieError,
@@ -649,3 +650,33 @@ def test_transfer_service_refuses_a_naive_clock(bank):
     strand the transfer as PENDING."""
     with pytest.raises(ValueError, match="timezone"):
         TransferService(bank.fake, bank.audit, now=datetime.now)
+
+
+def _card_owing(bank, owed):
+    card = bank.fake.create_account(bank.customer_id, AccountType.CREDIT_CARD, "Card", 0)
+    shop = bank.fake.create_merchant("Shop", "shopping")
+    bank.fake.create_purchase(card.id, shop.id, owed, TODAY, "groceries")
+    return card
+
+
+def test_a_card_payment_above_the_amount_owed_is_refused(bank):
+    """D57/V2-05: the cap lives in TransferService, next to the funds check."""
+    card = _card_owing(bank, 300)
+    with pytest.raises(TransferRejected, match="only owes \\$300") as info:
+        bank.service.create_pending(bank.customer_id, bank.checking.id, card.id, 301)
+    assert not info.value.retryable
+    assert bank.audit.records() == []
+    ok = bank.service.create_pending(bank.customer_id, bank.checking.id, card.id, 300)
+    assert bank.service.execute_pending(ok.transfer_id, customer_id=bank.customer_id).succeeded
+    with pytest.raises(TransferRejected, match="nothing is owed"):
+        bank.service.create_pending(bank.customer_id, bank.checking.id, card.id, 1)
+
+
+def test_a_card_payment_is_rechecked_at_execution(bank):
+    card = _card_owing(bank, 300)
+    pending = bank.service.create_pending(bank.customer_id, bank.checking.id, card.id, 200)
+    bank.fake.create_deposit(card.id, 250, TODAY, "paid elsewhere")
+    with pytest.raises(TransferRejected, match="only owes \\$50"):
+        bank.service.execute_pending(pending.transfer_id, customer_id=bank.customer_id)
+    assert bank.audit.get(pending.transfer_id).status is S.CANCELLED
+    assert bank.fake.list_withdrawals(bank.checking.id) == []

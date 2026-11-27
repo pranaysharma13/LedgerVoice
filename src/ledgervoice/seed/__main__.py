@@ -125,6 +125,7 @@ def _apply(seed: int, anchor: date, backend: BankBackend, server: str, store: Se
             save_registry=store.save_registry,
             audit_dir=store.audit_dir,
             on_progress=progress,
+            on_warning=lambda message: print(f"warning: {message}", file=sys.stderr),
         )
     except BankError as exc:
         print(

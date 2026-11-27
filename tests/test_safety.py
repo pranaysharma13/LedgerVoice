@@ -410,6 +410,22 @@ def test_a_second_proposal_while_one_is_pending_cancels_both(w: World) -> None:
     assert w.events() == ["proposed", "cancelled_second_proposal", "proposal_refused"]
 
 
+def test_a_third_proposal_in_the_same_turn_is_refused_too(w: World) -> None:
+    """V2-01: after both are cancelled, nothing more can be proposed until the user
+    speaks, so a third call (parallel, or the model re-proposing) can't slip in."""
+    assert w.propose("50").ok
+    assert not w.propose("700", dst=w.card).ok
+    third = w.propose("200", dst=w.card)
+    assert not third.ok and third.transfer_id is None
+    assert "nothing can be proposed until they answer" in third.say
+    assert w.session.pending_transfer_id is None
+    assert len(w.audit.records()) == 1
+    assert w.session.on_user_message("yes") == Intercept(handled=False)
+    assert w.balances() == (1000, 500, -CARD_OWED)
+    # once the user has spoken, proposing works again
+    assert w.propose("20").ok
+
+
 def test_changing_your_mind_in_a_reply_still_works(w: World) -> None:
     """The user's "make it $60" settles the first proposal; the model then proposes
     again in a new turn (D53, E as agreed)."""
@@ -598,6 +614,56 @@ def test_an_error_after_money_moved_never_claims_nothing_moved(w: World, monkeyp
     monkeypatch.undo()
     report = reconcile(w.bank, w.audit, [w.checking.id, w.savings.id], now=w.clock)
     assert report.count("stuck_in_progress") == 1
+
+
+def test_if_the_executed_event_cannot_be_logged_the_reply_still_arrives(
+    w: World, monkeypatch
+) -> None:
+    """V2-02: the money has moved; a failed log write must not swallow the reply (the
+    user would think nothing happened and might ask again)."""
+    tid = w.propose("50").transfer_id
+    _fail_when(monkeypatch, w.audit, "log_event", lambda _c, kind, **_: kind == "executed")
+    reply = w.session.on_user_message("yes")
+    assert reply.handled and reply.reply and "50" in reply.reply
+    assert w.audit.get(str(tid)).status is S.COMPLETED
+    assert w.balances() == (950, 550, -CARD_OWED)
+
+
+def test_if_the_confirmation_cannot_be_logged_nothing_moves(w: World, monkeypatch) -> None:
+    """V2-03: no money moves unless the "yes" is on record."""
+    tid = w.propose("50").transfer_id
+    _fail_when(monkeypatch, w.audit, "log_event", lambda _c, kind, **_: kind == "confirmed")
+    reply = w.session.on_user_message("yes")
+    assert reply.handled and "Nothing was moved" in str(reply.reply)
+    assert w.audit.get(str(tid)).status is S.CANCELLED
+    assert w.balances() == (1000, 500, -CARD_OWED)
+    assert w.bank.list_withdrawals(w.checking.id) == []
+
+
+def test_if_a_retry_cannot_be_logged_nothing_is_left_pending(w: World, monkeypatch) -> None:
+    """V2-03: the retry read-back must not be lost while the transfer stays pending
+    (a later "yes" would then execute a read-back the user never heard)."""
+    tid = w.propose("50").transfer_id
+    _flaky_reads(w, monkeypatch, failures=1)
+    _fail_when(monkeypatch, w.audit, "log_event", lambda _c, kind, **_: kind == "retry_offered")
+    reply = w.session.on_user_message("yes")
+    assert reply.handled and "Nothing was moved" in str(reply.reply)
+    assert w.session.pending_transfer_id is None
+    assert w.audit.get(str(tid)).status is S.CANCELLED
+    assert w.session.on_user_message("yes") == Intercept(handled=False)
+    assert w.balances() == (1000, 500, -CARD_OWED)
+
+
+def test_a_card_payment_is_checked_again_at_execution(w: World) -> None:
+    """V2-05: a payment that lands between proposal and "yes" lowers what the card
+    owes; the pending payment must not overpay it."""
+    tid = w.propose("200", dst=w.card).transfer_id
+    w.bank.create_deposit(w.card.id, 250, TODAY, "payment from elsewhere")  # owes $50 now
+    reply = w.session.on_user_message("yes")
+    assert reply.handled and "only owes $50" in str(reply.reply)
+    assert "Nothing was moved" in str(reply.reply)
+    assert w.audit.get(str(tid)).status is S.CANCELLED
+    assert w.balances() == (1000, 500, -50)
 
 
 def test_a_cancel_that_finds_the_money_already_moved_does_not_say_nothing_moved(

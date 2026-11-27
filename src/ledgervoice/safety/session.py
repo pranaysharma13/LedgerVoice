@@ -14,8 +14,9 @@ The only way money moves:
 At most one transfer can wait for an answer. A second `propose` while one is pending
 can only happen if the model asked for two transfers in one turn; the user can't know
 which read-back they heard, so BOTH are cancelled and the model asks again (R2-01).
-Because of that, a refused proposal never leaves anything pending that a "yes" could
-confirm (R2-02).
+Every further `propose` is refused until the user's next message, so a third call in
+the same turn can't slip in either (V2-01). Because of that, a refused proposal never
+leaves anything pending that a "yes" could confirm (R2-02).
 
 A temporary failure at execution (D39) keeps the transfer pending and repeats the
 read-back, so a fresh yes is needed; this happens at most `max_retries` times and
@@ -25,15 +26,24 @@ that is true (R2-04, R2-05).
 
 Every decision is written to the audit log's safety events (D55), with this session's
 id and the transfer's real status afterwards (`outcome`, R2-08). Messages that weren't
-a yes are not stored, only that they weren't a yes.
+a yes are not stored, only that they weren't a yes. Two kinds of log write (V2-02,
+V2-03):
+  - before money can move ("proposed", "confirmed", "retry_offered"): if the write
+    fails, the transfer is cancelled and never executed;
+  - after the outcome is settled (everything else): the write is best effort; a failure
+    goes to the Python log, and the user still gets the true reply. The transfer's own
+    record (and reconcile) still has its status.
 
 One SafetySession per conversation. Its methods are serialized by a lock, so a voice
-runtime's idle timer can call `expire_if_stale` from another thread (R2-05).
+runtime's idle timer can call `expire_if_stale` from another thread (R2-05). The lock
+is held while a transfer executes (bank calls, up to several seconds), so an async
+runtime must call these methods off its event loop, e.g. with asyncio.to_thread (V2-07).
 """
 
 from __future__ import annotations
 
 import contextlib
+import logging
 import threading
 import uuid
 from collections.abc import Callable
@@ -42,7 +52,6 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
 from nessie_tools import (
-    AccountType,
     AuditLog,
     BankBackend,
     BankError,
@@ -50,21 +59,16 @@ from nessie_tools import (
     TransferRejected,
     TransferService,
     TransferStatus,
-    compute_balance,
 )
 
 from ledgervoice.safety.confirm import is_clear_yes
-from ledgervoice.safety.policy import (
-    Proposal,
-    ProposalRejected,
-    check_card_payment,
-    check_proposal,
-)
+from ledgervoice.safety.policy import Proposal, ProposalRejected, check_proposal
 
 DEFAULT_MAX_AGE = timedelta(minutes=2)
 DEFAULT_MAX_RETRIES = 2
 NOTHING_MOVED = frozenset({TransferStatus.CANCELLED.value, TransferStatus.EXPIRED.value})
 UNKNOWN = "UNKNOWN"  # outcome when the transfer's status could not be read
+log = logging.getLogger(__name__)
 
 
 class Event(StrEnum):
@@ -140,6 +144,7 @@ class SafetySession:
         self._max_age = max_age
         self._max_retries = max_retries
         self._pending: _Pending | None = None
+        self._blocked = False  # after a double proposal, until the user's next message
         self._lock = threading.RLock()
 
     @property
@@ -154,6 +159,9 @@ class SafetySession:
         with self._lock:
             if self._pending is not None:  # R2-01: two proposals in one turn
                 return self._cancel_both(self._pending)
+            if self._blocked:  # V2-01: a third (or later) proposal in that same turn
+                self._log_after(Event.PROPOSAL_REFUSED, None, "blocked after two proposals")
+                return ProposeResult(False, _ASK_AGAIN)
             if not (
                 isinstance(from_last4, str)
                 and isinstance(to_last4, str)
@@ -163,17 +171,12 @@ class SafetySession:
             try:
                 accounts = self._bank.list_accounts(self.customer_id)
                 proposal = check_proposal(accounts, from_last4, to_last4, amount)
-                if proposal.destination.type is AccountType.CREDIT_CARD:  # R2-14
-                    owed = -compute_balance(
-                        self._bank, proposal.destination.id, account=proposal.destination
-                    ).current
-                    check_card_payment(proposal, owed)
             except ProposalRejected as exc:
                 return self._refuse(str(exc))
             except BankError:
                 return self._refuse("I couldn't look up your accounts just now; please try again")
 
-            try:
+            try:  # funds and the card cap (D57) are checked here, and again at execution
                 record = self._service.create_pending(
                     self.customer_id, proposal.source.id, proposal.destination.id, proposal.amount
                 )
@@ -198,6 +201,7 @@ class SafetySession:
     # --- step 2: the user answers ------------------------------------------------
     def on_user_message(self, text: str) -> Intercept:
         with self._lock:
+            self._blocked = False  # the user has spoken; proposals are allowed again
             pending = self._pending
             if pending is None:
                 return PASS_THROUGH
@@ -206,7 +210,7 @@ class SafetySession:
 
             if self._now() - pending.created > self._max_age:
                 status = self._cancel(tid, "no answer within the time limit", expired=True)
-                self._log(Event.EXPIRED, tid, outcome=status)
+                self._log_after(Event.EXPIRED, tid, outcome=status)
                 return Intercept(
                     handled=False,
                     note=f"The transfer request ({_summary(pending.proposal)}) expired before "
@@ -215,14 +219,17 @@ class SafetySession:
 
             if not isinstance(text, str) or not is_clear_yes(text):
                 status = self._cancel(tid, "the user's reply was not a clear yes")
-                self._log(Event.NOT_A_YES, tid, outcome=status)
+                self._log_after(Event.NOT_A_YES, tid, outcome=status)
                 return Intercept(
                     handled=False,
                     note=f"The transfer request ({_summary(pending.proposal)}) was cancelled "
                     f"because the user did not say yes. {_moved_note(status)}",
                 )
 
-            self._log(Event.CONFIRMED, tid, outcome=TransferStatus.PENDING.value)
+            try:  # V2-03: no money moves unless the confirmation is on record
+                self._log(Event.CONFIRMED, tid, outcome=TransferStatus.PENDING.value)
+            except Exception as exc:
+                return self._abandon(tid, f"could not log the confirmation: {exc}")
             return self._execute(pending)
 
     def expire_if_stale(self) -> str | None:
@@ -234,7 +241,7 @@ class SafetySession:
                 return None
             self._pending = None
             status = self._cancel(pending.transfer_id, "no answer within the time limit", True)
-            self._log(Event.EXPIRED, pending.transfer_id, outcome=status)
+            self._log_after(Event.EXPIRED, pending.transfer_id, outcome=status)
             return (
                 f"The transfer request ({_summary(pending.proposal)}) expired. "
                 f"{_moved_note(status)}"
@@ -247,7 +254,7 @@ class SafetySession:
             result = self._service.execute_pending(tid, customer_id=self.customer_id)
         except TransferExpired as exc:  # the nessie-tools backstop (D54)
             status = self._status(tid)
-            self._log(Event.EXPIRED_AT_EXECUTION, tid, str(exc), outcome=status)
+            self._log_after(Event.EXPIRED_AT_EXECUTION, tid, str(exc), outcome=status)
             return Intercept(
                 handled=True,
                 reply=f"That request had expired, so I didn't make the transfer. "
@@ -256,9 +263,12 @@ class SafetySession:
             )
         except TransferRejected as exc:
             if exc.retryable and pending.retries < self._max_retries:
+                try:  # V2-03: logged BEFORE it becomes pending again
+                    self._log(Event.RETRY_OFFERED, tid, str(exc), outcome=self._status(tid))
+                except Exception as log_exc:
+                    return self._abandon(tid, f"could not log the retry: {log_exc}")
                 pending.retries += 1
                 self._pending = pending  # still pending; a fresh yes is needed
-                self._log(Event.RETRY_OFFERED, tid, str(exc), outcome=self._status(tid))
                 return Intercept(
                     handled=True,
                     reply="I couldn't complete that just now. " + pending.proposal.read_back(),
@@ -267,7 +277,7 @@ class SafetySession:
                 status = self._cancel(tid, f"gave up after {pending.retries} retries: {exc}")
             else:  # nessie-tools already cancelled it; read what it says now
                 status = self._status(tid)
-            self._log(Event.EXECUTION_REFUSED, tid, str(exc), outcome=status)
+            self._log_after(Event.EXECUTION_REFUSED, tid, str(exc), outcome=status)
             return Intercept(
                 handled=True,
                 reply=f"I couldn't make that transfer: {exc}. {_moved_reply(status)}",
@@ -277,7 +287,9 @@ class SafetySession:
             status = self._status(tid)
             if status == TransferStatus.PENDING.value:
                 status = self._cancel(tid, f"error during execution: {type(exc).__name__}")
-            self._log(Event.EXECUTION_ERROR, tid, f"{type(exc).__name__}: {exc}", outcome=status)
+            self._log_after(
+                Event.EXECUTION_ERROR, tid, f"{type(exc).__name__}: {exc}", outcome=status
+            )
             if status in NOTHING_MOVED:
                 reply = "Something went wrong, so I didn't make that transfer. Nothing was moved."
             else:
@@ -286,17 +298,19 @@ class SafetySession:
                     "through. Please check your balances before trying again."
                 )
             return Intercept(handled=True, reply=reply, note=f"Transfer status: {status}.")
-        self._log(Event.EXECUTED, tid, result.message, outcome=result.status.value)
+        # V2-02: the money has moved (or the saga settled); the reply must reach the user
+        self._log_after(Event.EXECUTED, tid, result.message, outcome=result.status.value)
         return Intercept(handled=True, reply=result.message, note=result.message)
 
     # --- helpers -----------------------------------------------------------------
     def _cancel_both(self, pending: _Pending) -> ProposeResult:
         self._pending = None
+        self._blocked = True  # V2-01: nothing more until the user speaks
         status = self._cancel(
             pending.transfer_id, "a second transfer was proposed before an answer"
         )
-        self._log(Event.CANCELLED_DOUBLE, pending.transfer_id, outcome=status)
-        self._log(Event.PROPOSAL_REFUSED, None, "proposed while another transfer was pending")
+        self._log_after(Event.CANCELLED_DOUBLE, pending.transfer_id, outcome=status)
+        self._log_after(Event.PROPOSAL_REFUSED, None, "proposed while another was pending")
         moved = (
             "nothing was moved"
             if status in NOTHING_MOVED
@@ -308,8 +322,20 @@ class SafetySession:
             f"one was cancelled ({moved}). Ask the user which single transfer they want.",
         )
 
+    def _abandon(self, transfer_id: str, why: str) -> Intercept:
+        """A log write failed before any money moved (V2-03): cancel, never execute."""
+        status = self._cancel(transfer_id, why)
+        log.error(
+            "safety session %s: %s; transfer %s is %s", self.session_id, why, transfer_id, status
+        )
+        return Intercept(
+            handled=True,
+            reply=f"Something went wrong, so I didn't make that transfer. {_moved_reply(status)}",
+            note=f"The transfer was not made. {_moved_note(status)}",
+        )
+
     def _refuse(self, reason: str) -> ProposeResult:
-        self._log(Event.PROPOSAL_REFUSED, None, reason)
+        self._log_after(Event.PROPOSAL_REFUSED, None, reason)
         end = "" if reason.endswith((".", "?", "!")) else "."
         return ProposeResult(False, f"That transfer can't be set up: {reason}{end}")
 
@@ -325,7 +351,7 @@ class SafetySession:
         except Exception:  # not pending any more, or the audit log failed: look
             status = self._status(transfer_id)
         if status not in NOTHING_MOVED:
-            self._log(Event.STATE_MISMATCH, transfer_id, f"cancel: {reason}", outcome=status)
+            self._log_after(Event.STATE_MISMATCH, transfer_id, f"cancel: {reason}", outcome=status)
         return status
 
     def _status(self, transfer_id: str) -> str:
@@ -346,6 +372,28 @@ class SafetySession:
             session_id=self.session_id,
             outcome=outcome,
         )
+
+    def _log_after(
+        self, kind: Event, transfer_id: str | None, detail: str = "", *, outcome: str = ""
+    ) -> None:
+        """Best effort, for decisions already settled (V2-02): a failed write must not
+        stop the true reply from reaching the user. It is reported to the Python log."""
+        try:
+            self._log(kind, transfer_id, detail, outcome=outcome)
+        except Exception:
+            log.exception(
+                "safety session %s: could not log %s for %s (outcome %s)",
+                self.session_id,
+                kind.value,
+                transfer_id,
+                outcome,
+            )
+
+
+_ASK_AGAIN = (
+    "Several transfers were requested at once, so none was set up. Ask the user which "
+    "single transfer they want; nothing can be proposed until they answer."
+)
 
 
 def _summary(p: Proposal) -> str:

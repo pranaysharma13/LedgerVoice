@@ -228,6 +228,10 @@ class AuditLog:
     def _read_version(self) -> int:
         return int(self._conn.execute("PRAGMA user_version").fetchone()[0])
 
+    def now(self) -> datetime:
+        """The clock this log stamps records with (reconcile ages records by it)."""
+        return self._now()
+
     @property
     def schema_version(self) -> int:
         with self._lock:

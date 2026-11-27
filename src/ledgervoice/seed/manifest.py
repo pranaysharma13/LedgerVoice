@@ -69,6 +69,9 @@ class Manifest:
         return cls(**data)
 
 
+ABANDONED = "abandoned_customers"
+
+
 @dataclass
 class Registry:
     """server -> kind ("merchants" | "customers") -> plan key -> bank id."""
@@ -80,6 +83,14 @@ class Registry:
 
     def set(self, server: str, kind: str, key: str, bank_id: str) -> None:
         self.servers.setdefault(server, {}).setdefault(kind, {})[key] = bank_id
+
+    def abandon(self, server: str, customer_id: str, note: str) -> None:
+        """Remember a customer that was not reused because it still had accounts
+        (V2-06): kind "abandoned_customers", customer id -> what it still holds."""
+        self.set(server, ABANDONED, customer_id, note)
+
+    def abandoned(self, server: str) -> dict[str, str]:
+        return dict(self.servers.get(server, {}).get(ABANDONED, {}))
 
     def to_json(self) -> str:
         return json.dumps(self.servers, indent=2, sort_keys=True)

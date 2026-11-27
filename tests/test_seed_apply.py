@@ -327,8 +327,13 @@ def test_a_timed_out_account_create_never_leaves_a_hidden_account(small: SeedPla
     old_customer = aborted.customers["priya"]
     assert len(bank.list_accounts(old_customer)) == 1  # the stray one survived reset
     bank.create_account = real  # type: ignore[method-assign]
-    again = apply_plan(small, bank, server="fake", registry=registry)
+    (stray,) = bank.list_accounts(old_customer)
+    warnings: list[str] = []
+    again = apply_plan(small, bank, server="fake", registry=registry, on_warning=warnings.append)
     assert again.customers["priya"] != old_customer  # not reused
+    # V2-06: the abandoned customer and what it still holds are reported and remembered
+    assert len(warnings) == 1 and old_customer in warnings[0] and stray.id in warnings[0]
+    assert stray.id in registry.abandoned("fake")[old_customer]
     assert len(bank.list_accounts(again.customers["priya"])) == len(small.accounts)
     assert verify(small, bank, again).ok
 

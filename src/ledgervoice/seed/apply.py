@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import TypeVar
 
 from nessie_tools import (
+    Account,
     Address,
     AuditLog,
     BankBackend,
@@ -56,6 +57,7 @@ def apply_plan(
     save_registry: Callable[[Registry], None] = lambda _: None,
     audit_dir: Path | None = None,
     on_progress: Callable[[int, int], None] = lambda done, total: None,
+    on_warning: Callable[[str], None] = lambda message: None,
     clock: Callable[[], float] = time.perf_counter,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> Manifest:
@@ -100,14 +102,28 @@ def apply_plan(
             save_registry(registry)
         save(manifest)
 
-    # customers: reuse when the bank still has the same name
+    # customers: reuse when the bank still has the same name and no accounts
     for c in plan.customers:
         known = registry.get(server, "customers", c.key)
-        if known is not None and _customer_matches(backend, known, c.first_name, c.last_name):
+        leftover = (
+            None if known is None else _leftover_accounts(backend, known, c.first_name, c.last_name)
+        )
+        if known is not None and leftover == []:
             manifest.customers[c.key] = known
             done += 1
             on_progress(done, total)
         else:
+            if known is not None and leftover:
+                # V2-06: say so, and remember it; reset can't delete what it never listed
+                held = ", ".join(
+                    f"{a.type.value} {a.id} (opening ${a.balance:,})" for a in leftover
+                )
+                registry.abandon(server, known, f"{c.key}: {held}")
+                save_registry(registry)
+                on_warning(
+                    f"customer {c.key} ({known}) still has accounts not in any manifest "
+                    f"({held}); seeding a new customer instead"
+                )
             created_c = timed(
                 partial(backend.create_customer, c.first_name, c.last_name, SEED_ADDRESS)
             )
@@ -214,15 +230,19 @@ def _merchant_matches(backend: BankBackend, merchant_id: str, name: str, categor
     return found.name == name and found.category == category
 
 
-def _customer_matches(backend: BankBackend, customer_id: str, first: str, last: str) -> bool:
-    """Same name, and no accounts left over from an earlier seed (R2-06)."""
+def _leftover_accounts(
+    backend: BankBackend, customer_id: str, first: str, last: str
+) -> list[Account] | None:
+    """None if the customer is gone or renamed (not reusable); otherwise the accounts it
+    still holds. Only a customer with none is reused (R2-06): an account a timed-out
+    create left behind is in no manifest, so reset can't delete it."""
     try:
         found = backend.get_customer(customer_id)
     except NotFoundError:
-        return False
+        return None
     if (found.first_name, found.last_name) != (first, last):
-        return False
-    return not backend.list_accounts(customer_id)
+        return None
+    return backend.list_accounts(customer_id)
 
 
 def _timing(durations: list[float]) -> dict[str, float]:

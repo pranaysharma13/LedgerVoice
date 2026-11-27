@@ -241,3 +241,25 @@ def test_a_stale_pending_transfer_is_reported(bank):
     assert run(bank, now=lambda: created + timedelta(hours=1), stale_after=None).ok
     bank.service.cancel_pending(pending.transfer_id, customer_id=bank.customer_id)
     assert run(bank, now=lambda: created + timedelta(hours=1)).ok  # settled: not reported
+
+
+def test_stale_pending_ages_records_by_the_audit_logs_own_clock(bank):
+    """V2-04: by default reconcile uses the clock that stamped the records, honours the
+    configured window, and refuses a naive clock."""
+    from datetime import UTC
+
+    from nessie_tools import AuditLog, TransferService
+
+    t = {"now": datetime(2026, 11, 24, 12, 0, tzinfo=UTC)}
+    audit = AuditLog(":memory:", now=lambda: t["now"])
+    service = TransferService(bank.fake, audit, now=lambda: t["now"], max_age=timedelta(minutes=5))
+    service.create_pending(bank.customer_id, bank.checking.id, bank.savings.id, 5)
+    accounts = [bank.checking.id, bank.savings.id]
+    assert reconcile(bank.fake, audit, accounts).ok  # wall clock is days later: not used
+    t["now"] += timedelta(minutes=3)
+    assert reconcile(bank.fake, audit, accounts, stale_after=service.max_age).ok
+    t["now"] += timedelta(minutes=3)
+    stale = reconcile(bank.fake, audit, accounts, stale_after=service.max_age)
+    assert stale.count(V.STALE_PENDING) == 1
+    with pytest.raises(ValueError, match="timezone"):
+        reconcile(bank.fake, audit, accounts, now=datetime.now)

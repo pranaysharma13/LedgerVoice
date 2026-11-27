@@ -59,7 +59,7 @@ from nessie_tools.errors import (
     is_ambiguous,
     is_temporary,
 )
-from nessie_tools.models import Account, Deposit, Withdrawal
+from nessie_tools.models import Account, AccountType, Deposit, Withdrawal
 from nessie_tools.money import require_whole_dollars
 
 S = TransferStatus
@@ -174,6 +174,11 @@ class TransferService:
         self._now = now
         self._max_age = max_age
 
+    @property
+    def max_age(self) -> timedelta | None:
+        """The confirmation window; pass it to reconcile(stale_after=...) (V2-04)."""
+        return self._max_age
+
     # --- step 1: propose ---------------------------------------------------------
     def create_pending(
         self, customer_id: str, from_account_id: str, to_account_id: str, amount: int
@@ -183,8 +188,9 @@ class TransferService:
         Raises TransferRejected if a check fails (nothing is recorded).
         """
         amount = self._require_amount(amount)
-        src, _dst = self._check_accounts(customer_id, from_account_id, to_account_id)
+        src, dst = self._check_accounts(customer_id, from_account_id, to_account_id)
         self._check_funds(src, amount)
+        self._check_card_payment(dst, amount)
         return self._audit.create(
             self._new_id(), customer_id, from_account_id, to_account_id, amount, status=S.PENDING
         )
@@ -217,6 +223,7 @@ class TransferService:
                     record.customer_id, record.from_account, record.to_account
                 )
                 self._check_funds(src, record.amount)
+                self._check_card_payment(dst, record.amount)
             except TransferRejected as exc:
                 if not exc.retryable:
                     self._audit.transition(
@@ -452,6 +459,26 @@ class TransferService:
             ) from None
         if amount > available:
             raise TransferRejected(f"insufficient funds: ${available} available")
+
+    def _check_card_payment(self, dst: Account, amount: int) -> None:
+        """A payment into a credit card can't be more than the card owes (D57, D45).
+        Checked when proposing and again at execution, like the funds check, because a
+        payment may land in between (V2-05). Owed = minus the computed balance."""
+        if dst.type is not AccountType.CREDIT_CARD:
+            return
+        try:
+            owed = -compute_balance(self._bank, dst.id, account=dst).current
+        except BankError as exc:
+            raise TransferRejected(
+                f"could not read what the card owes: {exc}", retryable=is_temporary(exc)
+            ) from None
+        card = f"credit card ending in {dst.last4}"
+        if owed <= 0:
+            raise TransferRejected(f"nothing is owed on the {card}, so there is nothing to pay")
+        if amount > owed:
+            raise TransferRejected(
+                f"the {card} only owes ${owed:,}, so the most you can pay into it is ${owed:,}"
+            )
 
 
 def _clip(text: str) -> str:

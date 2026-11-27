@@ -40,6 +40,7 @@ def test_small_live_seed_round_trip() -> None:
     store = SeedStore(LIVE_TEST_DIR)
     plan = generate(42, date(2026, 11, 23)).subset("priya", 15)
     manifests: list[Manifest] = []
+    reset_problems: list[str] = []
     try:
         for _ in range(2):
             registry = store.load_registry()
@@ -57,8 +58,13 @@ def test_small_live_seed_round_trip() -> None:
                 report = verify(plan, backend, manifest, audit=AuditLog(":memory:"))
                 assert report.ok, report.problems
             finally:
+                # V2-08: never raise here, so an error already on its way out is not
+                # replaced; reset problems are printed and asserted after the loop
                 if current and current[-1].status is not SeedStatus.RESET:
-                    assert reset(backend, current[-1], server=server) == []
+                    problems = reset(backend, current[-1], server=server)
+                    for p in problems:
+                        print(f"reset problem: {p}")
+                    reset_problems.extend(problems)
             assert manifest.status is SeedStatus.RESET
             for account_id in manifest.accounts.values():
                 with pytest.raises(NotFoundError):
@@ -67,6 +73,7 @@ def test_small_live_seed_round_trip() -> None:
                 assert backend.list_accounts(customer_id) == []  # nothing hidden left
     finally:
         client.close()
+    assert reset_problems == []
     first, second = manifests
     assert second.merchants == first.merchants  # reused (D51)
     assert second.customers == first.customers

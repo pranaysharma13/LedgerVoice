@@ -34,11 +34,11 @@ import re
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Literal
 
-from nessie_tools.audit import AuditLog, TransferRecord, TransferStatus
+from nessie_tools.audit import AuditLog, TransferRecord, TransferStatus, require_aware_clock
 from nessie_tools.backend import BankBackend
 from nessie_tools.balances import compute_balance
 from nessie_tools.errors import NotFoundError
@@ -141,15 +141,19 @@ def reconcile(
     account_ids: Iterable[str] = (),
     *,
     customer_ids: Iterable[str] | None = None,
-    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    now: Callable[[], datetime] | None = None,
     stale_after: timedelta | None = DEFAULT_MAX_AGE,
 ) -> ReconcileReport:
     """Check the audit log against the bank.
 
     Scans `account_ids` plus every account referenced by the in-scope records. Pass
     every account the agent can touch, and the customer ids of the current run.
-    `stale_after=None` turns off the stale_pending check.
+    stale_pending ages records by `now`, which defaults to the audit log's own clock
+    (the one that stamped them, V2-04). Pass `stale_after=service.max_age` so the
+    window matches the confirmation window in use; `stale_after=None` turns it off.
     """
+    clock = audit.now if now is None else now
+    require_aware_clock(clock, "reconcile")
     report = ReconcileReport()
     scope = None if customer_ids is None else frozenset(customer_ids)
     all_records = audit.records()
@@ -206,7 +210,7 @@ def reconcile(
     for record in records:
         report.violations.extend(_check_record(record, legs_by_tid.get(record.transfer_id, [])))
         if stale_after is not None and record.status is TransferStatus.PENDING:
-            age = now() - datetime.fromisoformat(record.created_at)
+            age = clock() - datetime.fromisoformat(record.created_at)
             if age > stale_after:
                 report.violations.append(
                     Violation(
